@@ -1,37 +1,60 @@
 #!/usr/bin/env python3
 import sys
-import nbtlib
+import io
 from nbtlib.tag import Compound, String, List, Byte
+
 
 # 1. Текст с информацией о необходимости входа
 # Minecraft поддерживает форматированный JSON внутри поля текста/заголовка
-body_text = String('{"text": "Для продолжения игры вам необходимо пройти авторизацию на нашем сайте.", "color": "white"}')
-
-# 2. Кнопка с кликабельной ссылкой (open_url)
-# Диалог рендерит интерактивные кнопки или элементы ввода из массива buttons/actions
-buttons = List[Compound]([
-    Compound({
-        "label": String('{"text": "[ Нажмите здесь, чтобы пройти авторизацию ]", "color": "blue", "underlined": true}'),
-        "action": Compound({
-            "type": String("open_url"),
-            "url": String("https://example.com/login")
-        })
+body_text = Compound({
+    "type": String("minecraft:plain_message"),
+    "contents": Compound({
+        "text": String("Для продолжения игры вам необходимо пройти авторизацию на нашем сайте."),
+        "color": String("white")
     })
-])
+})
 
 # 3. Собираем итоговую структуру NBT-диалога
 dialog_tag = Compound({
-    "title": String('{"text": "Авторизация требуется", "color": "gold", "bold": true}'),
-    "body": body_text,
-    "buttons": buttons,
+    "type": String("minecraft:confirmation"),
+    "title": Compound({
+        "text": String("Требуется авторизация"),
+        "color": String("gold"),
+        "bold": Byte(1)  # bool в NBT передается как Byte (1 = true, 0 = false)
+    }),
+    "body": List[Compound]([body_text]),
+    "no": Compound({
+        "label": Compound({
+            "text": String("Выйти с сервера"),
+            "color": String("red")
+        }),
+        "action": Compound({
+            "type": String("custom"),
+            "id": String("")
+        })
+    }),
+    "yes": Compound({
+        "label": Compound({
+            "text": String("Перейти на сайт"),
+            "color": String("green")
+        }),
+        "action": Compound({
+            "type": String("open_url"),
+            "url": String("https://example.com")
+        })
+    }),
     "pause": Byte(1)  # Заставляет игру встать на паузу (для одиночки) или заблокировать задний фон
 })
 
-# Оборачиваем в корневой тег
-root = Compound({
-    "data": dialog_tag
-})
+# 2. Сериализуем данные
+buffer = io.BytesIO()
 
-# Сохраняем в несжатом бинарном виде (uncompressed NBT)
-nbt_file = nbtlib.File(root, gzipped=False)
-nbt_file.write(sys.stdout.buffer)
+# Шаг А: Пишем ID корневого тега (0x0a - TAG_Compound)
+buffer.write(bytes([0x0A]))
+dialog_tag.write(buffer, byteorder="big")
+
+# 3. Получаем итоговые байты
+network_bytes = buffer.getvalue()
+
+# 4. Выводим сырые байты в stdout
+sys.stdout.buffer.write(network_bytes)

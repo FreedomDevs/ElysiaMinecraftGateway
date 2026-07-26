@@ -15,8 +15,8 @@ public:
     writer.writeString(username);
     writer.writeVarInt(0);
 
-    // writer.writeLong(UUID_part1);
-    // writer.writeLong(UUID_part2);
+    writer.writeLong(UUID_part1);
+    writer.writeLong(UUID_part2);
 
     writer.setPacketId(2);
   };

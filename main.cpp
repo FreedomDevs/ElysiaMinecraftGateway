@@ -64,7 +64,7 @@ static inline void readAndWriteDataPack() {
   dialog = std::span<char>(addr, sb.st_size);
 }
 
-static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
+static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
   if (client->state == ConnectionState::HandShake) {
     if (packet.getPacketId() != 0)
       throw std::runtime_error("Incorrect packet id");
@@ -131,7 +131,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
       write(client->fd, writer.getData().data(), writer.getData().size());
     } else {
-      throw std::runtime_error("Incorrect packet id");
+      throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
   } else if (client->state == ConnectionState::Login) {
     if (packet.getPacketId() == 0) {
@@ -145,7 +145,6 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       writer.writeUncompressed();
       write(client->fd, writer.getData().data(), writer.getData().size());
       client->isLoginSuccess = true;
-
     } else if (packet.getPacketId() == 3) {
       LoginAcknowledged res;
       res.decode(packet);
@@ -162,11 +161,18 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       writer.setPacketId(18);
       writer.writeUncompressed();
       write(client->fd, writer.getData().data(), writer.getData().size());
+    } else {
+      throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
-
   } else if (client->state == ConnectionState::Configuration) {
-    if (packet.getPacketId() == 0) {
+    if (packet.getPacketId() == 0 || packet.getPacketId() == 2) {
       return;
+    } else if (packet.getPacketId() == 8) {
+      std::cout << "Client closed connection";
+      clients.erase(clients.begin() + client_index);
+      close(client->fd);
+    } else {
+      throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
   } else {
     throw std::runtime_error("Incorrect state");
@@ -206,7 +212,7 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       if (!ret.has_value())
         break;
 
-      onPacket(client, reader);
+      onPacket(client, reader, client_index);
 
       memmove(client->buf.data(), client->buf.data() + *ret, client->buf.size() - *ret);
       client->buf.resize(client->buf.size() - *ret);

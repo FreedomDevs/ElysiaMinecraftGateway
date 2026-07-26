@@ -18,7 +18,7 @@ std::string readString(std::span<unsigned char> data, size_t &offset) {
 }
 
 void writeString(const std::string &str, std::vector<unsigned char> &data) {
-  std::vector<unsigned char> lengthPrefix = data;
+  std::vector<unsigned char> lengthPrefix;
   VarInt::writeVarInt(str.size(), lengthPrefix);
 
   data.insert(data.end(), lengthPrefix.begin(), lengthPrefix.end());
