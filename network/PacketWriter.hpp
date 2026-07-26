@@ -18,9 +18,9 @@ public:
     std::vector<unsigned char> test_buffer;
     VarInt::writeVarInt(packet_id, test_buffer);
     writeVarInt(old_data.size() + test_buffer.size());
-    append_vector(test_buffer);
+    writeArray(test_buffer);
 
-    append_vector(old_data);
+    writeArray(old_data);
   }
   void writeCompressed() {}
 
@@ -44,7 +44,5 @@ public:
   void writeVarInt(int data) { VarInt::writeVarInt(data, this->data); }
   void writeString(std::string data) { String::writeString(data, this->data); }
 
-  void append_vector(std::vector<unsigned char> vector) {
-    data.insert(data.end(), vector.begin(), vector.end());
-  }
+  void writeArray(std::span<unsigned char> vector) { data.insert(data.end(), vector.begin(), vector.end()); }
 };

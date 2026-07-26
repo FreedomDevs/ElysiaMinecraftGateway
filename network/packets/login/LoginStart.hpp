@@ -3,8 +3,6 @@
 #include "../../PacketReader.hpp"
 #include <string>
 
-enum class ConnectionReason : int { Status = 1, Connnect = 2, Transfer = 3 };
-
 class LoginStart : public BasePacket {
 private:
   std::string username;

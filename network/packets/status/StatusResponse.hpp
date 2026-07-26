@@ -1,5 +1,4 @@
-#ifndef NETWORK_PACKETS_STATUS_STATUSRESPONSE_HPP
-#define NETWORK_PACKETS_STATUS_STATUSRESPONSE_HPP
+#pragma once
 
 #include "../../BasePacket.hpp"
 #include "../../PacketWriter.hpp"
@@ -16,5 +15,3 @@ public:
 
   PacketWriter getPacketWriter() { return writer; }
 };
-
-#endif // NETWORK_PACKETS_STATUS_STATUSRESPONSE_HPP
