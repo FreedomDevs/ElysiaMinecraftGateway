@@ -10,6 +10,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <curl/multi.h>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
@@ -19,6 +21,7 @@
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <vector>
 
@@ -37,6 +40,10 @@ struct MinecraftClient {
 std::vector<MinecraftClient> clients;
 
 static std::span<char> dialog;
+
+int epoll_fd;
+int timer_fd;
+CURLM *multi_handle;
 
 static inline void readAndWriteDataPack() {
   int filefd = open("dialog", O_RDONLY);
@@ -224,24 +231,85 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
   }
 }
 
+static int cb_socket_action(CURL *easy, curl_socket_t s, int action, void *userp, void *socketp) {
+  epoll_event ev{};
+  ev.data.fd = s;
+
+  if (action == CURL_POLL_IN) {
+    ev.events = EPOLLIN;
+  } else if (action == CURL_POLL_OUT) {
+    ev.events = EPOLLOUT;
+  } else if (action == CURL_POLL_INOUT) {
+    ev.events = EPOLLIN | EPOLLOUT;
+  } else if (action == CURL_POLL_REMOVE) {
+    // Удаляем сокет из epoll
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, s, nullptr);
+    return 0;
+  }
+
+  // Если сокет уже регистрировался ранее (socketp != nullptr), делаем MOD, иначе ADD
+  int op = (socketp != nullptr) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+  epoll_ctl(epoll_fd, op, s, &ev);
+
+  // Сохраняем маркер, что сокет зарегистрирован
+  curl_multi_assign(multi_handle, s, (void *)1);
+
+  return 0;
+}
+
+static int cb_timer_action(CURLM *multi, long timeout_ms, void *userp) {
+  // struct itimerspec задает, через сколько сработает timerfd
+  struct itimerspec its{};
+
+  if (timeout_ms < 0) {
+    // timeout_ms < 0 означает, что curl просит отменить текущий таймер
+    // Передаем нулевой its — это выключает timerfd
+    timerfd_settime(timer_fd, 0, &its, nullptr);
+
+  } else {
+    // Если curl просит 0 мс, взводим на 1 нс (минимально возможное время),
+    // чтобы epoll_wait сработал сразу на следующей итерации
+    if (timeout_ms == 0) {
+      its.it_value.tv_nsec = 1;
+    } else {
+      // Переводим миллисекунды в секунды и наносекунды
+      its.it_value.tv_sec = timeout_ms / 1000;
+      its.it_value.tv_nsec = (timeout_ms % 1000) * 1000000;
+    }
+
+    // Заряжаем timerfd!
+    timerfd_settime(timer_fd, 0, &its, nullptr);
+  }
+
+  return 0;
+}
+
 int main() {
   readAndWriteDataPack();
   int tcpfd = initTcp(PORT);
   std::cout << "Запущен сокет на порту " << PORT << std::endl;
 
-  int epfd = epoll_create(32);
+  epoll_fd = epoll_create1(O_CLOEXEC);
+  timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.fd = tcpfd;
-  epoll_ctl(epfd, EPOLL_CTL_ADD, tcpfd, &ev);
+  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tcpfd, &ev);
+
+  multi_handle = curl_multi_init();
+  curl_multi_setopt(multi_handle, CURLMOPT_SOCKETDATA, nullptr);
+  curl_multi_setopt(multi_handle, CURLMOPT_SOCKETFUNCTION, cb_socket_action);
+  curl_multi_setopt(multi_handle, CURLMOPT_TIMERDATA, nullptr);
+  curl_multi_setopt(multi_handle, CURLMOPT_TIMERFUNCTION, cb_timer_action);
 
   struct epoll_event events[32];
   while (1) {
-    int count = epoll_wait(epfd, events, 32, -1);
+    int count = epoll_wait(epoll_fd, events, 32, -1);
 
     for (int i = 0; i < count; i++) {
       int fd = events[i].data.fd;
+      uint32_t event = events[i].events;
 
       if (fd == tcpfd) {
         int clientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -259,14 +327,45 @@ int main() {
 
         ev.events = EPOLLIN;
         ev.data.fd = clientfd;
-        epoll_ctl(epfd, EPOLL_CTL_ADD, clientfd, &ev);
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, clientfd, &ev);
+      } else if (fd == timer_fd) {
+        // 1. Обязательно "прочитываем" timerfd, чтобы сбросить его готовность в epoll
+        uint64_t expirations;
+        read(timer_fd, &expirations, sizeof(expirations));
+
+        // 2. Сообщаем curl, что время вышло!
+        int running_handles = 0;
+        curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
+
+        // 3. Проверяем, не завершился ли какой-то запрос
+        // check_completed_requests();
       } else {
         for (size_t i = 0; i < clients.size(); i++) {
           struct MinecraftClient *client = &clients[i];
           if (fd == client->fd) {
             onClientUpdate(client, i);
           }
+
+          break;
         }
+
+        int action_mask = 0;
+        if (event & EPOLLIN) {
+          action_mask |= CURL_CSELECT_IN; // Есть данные для чтения
+        }
+        if (event & EPOLLOUT) {
+          action_mask |= CURL_CSELECT_OUT; // Сокет готов к записи
+        }
+        if (event & (EPOLLERR | EPOLLHUP)) {
+          action_mask |= CURL_CSELECT_ERR; // Ошибка или разрыв соединения
+        }
+
+        // 2. Уведомляем curl, что на сокете fd произошло событие action_mask
+        int running_handles = 0;
+        curl_multi_socket_action(multi_handle, fd, action_mask, &running_handles);
+
+        // 3. Проверяем, не завершился ли запрос в результате этого I/O
+        // check_completed_requests();
       }
     }
   }

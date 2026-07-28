@@ -10,6 +10,10 @@ pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
     ninja
   ];
 
+  buildInputs = with pkgs; [
+    curl
+  ];
+
   shellHook = ''
     export CPATH="${pkgs.glibc.dev}/include"
     export LIBRARY_PATH="${pkgs.glibc}/lib"
