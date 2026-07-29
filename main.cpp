@@ -404,14 +404,16 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
 
       while (std::getline(sq, key, '=') && std::getline(sq, value)) {
         if (key == "token") {
-          token == value;
+          token = value;
         } else if (key == "state") {
-          state == value;
+          state = value;
         } else {
           std::cout << "Неизвестное значение " << part[i] << std::endl;
         }
       }
     }
+
+    std::cout << "token " << token << "state " << state << std::endl;
 
   } catch (const std::exception &e) {
     std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
