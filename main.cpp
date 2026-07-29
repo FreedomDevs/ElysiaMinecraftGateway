@@ -18,6 +18,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <sys/epoll.h>
 #include <sys/mman.h>
@@ -41,7 +42,13 @@ struct MinecraftClient {
   std::string elysaiAuthState;
 };
 
+struct WebClient {
+  int fd;
+  std::vector<unsigned char> buf;
+};
+
 std::vector<MinecraftClient> clients;
+std::vector<WebClient> web_clients;
 
 static std::span<char> dialog;
 
@@ -346,11 +353,79 @@ static int cb_timer_action(CURLM *multi, long timeout_ms, void *userp) {
   return 0;
 }
 
+static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
+  std::string token, state;
+
+  long ret;
+  char temp_buf[4096];
+  while ((ret = read(client->fd, temp_buf, sizeof(temp_buf))) > 0) {
+    client->buf.insert(client->buf.end(), temp_buf, temp_buf + ret);
+  };
+
+  if (ret < 0 and errno != EAGAIN) {
+    perror("Client error(connection closed): ");
+    clients.erase(clients.begin() + client_index);
+    close(client->fd);
+    return;
+  }
+
+  if (ret == 0) {
+    std::cout << "Client closed connection" << std::endl;
+    clients.erase(clients.begin() + client_index);
+    close(client->fd);
+    return;
+  }
+
+  try {
+    std::string request(client->buf.begin(), client->buf.end());
+
+    ssize_t end = request.find("\r\n");
+    std::string firstLine = request.substr(0, end);
+    ssize_t q = firstLine.find('?');
+    if (q == std::string::npos) {
+      return;
+    }
+
+    size_t http = firstLine.find(" HTTP/", q);
+
+    std::string query = firstLine.substr(q + 1, http - q - 1);
+
+    std::vector<std::string> parts;
+    std::stringstream ss(query);
+    std::string part;
+
+    while (std::getline(ss, part, '&')) {
+      parts.push_back(part);
+    }
+
+    for (size_t i = 0; i < parts.size(); i++) {
+      std::stringstream sq(parts[i]);
+      std::string key, value;
+
+      while (std::getline(sq, key, '=') && std::getline(sq, value)) {
+        if (key == "token") {
+          token == value;
+        } else if (key == "state") {
+          state == value;
+        } else {
+          std::cout << "Неизвестное значение " << part[i] << std::endl;
+        }
+      }
+    }
+
+  } catch (const std::exception &e) {
+    std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
+    clients.erase(clients.begin() + client_index);
+    close(client->fd);
+  }
+}
+
 int main() {
   readAndWriteDataPack();
   int tcpfd = initTcp(PORT);
   std::cout << "Запущен сокет на порту " << PORT << std::endl;
-  // int webTcpFd = initTcp(WEB_PORT);
+  int webTcpFd = initTcp(WEB_PORT);
+  std::cout << "Запущен веб сокет на порту " << WEB_PORT << std::endl;
 
   epoll_fd = epoll_create1(O_CLOEXEC);
   timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -359,6 +434,10 @@ int main() {
   ev.events = EPOLLIN;
   ev.data.fd = tcpfd;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tcpfd, &ev);
+
+  ev.events = EPOLLIN;
+  ev.data.fd = webTcpFd;
+  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webTcpFd, &ev);
 
   multi_handle = curl_multi_init();
   curl_multi_setopt(multi_handle, CURLMOPT_SOCKETDATA, nullptr);
@@ -402,7 +481,31 @@ int main() {
 
         // 3. Проверяем, не завершился ли какой-то запрос
         // check_completed_requests();
+      } else if (fd == webTcpFd) {
+        int webclientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (webclientfd < 0) {
+          perror("web client error");
+          continue;
+        }
+
+        struct WebClient client;
+        client.fd = webclientfd;
+        std::cout << "Web clietn " << webclientfd << " connected" << std::endl;
+
+        web_clients.push_back(client);
+
+        ev.events = EPOLLIN;
+        ev.data.fd = webclientfd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webclientfd, &ev);
       } else {
+        for (size_t i = 0; i < web_clients.size(); i++) {
+          struct WebClient *client = &web_clients[i];
+          if (fd == client->fd) {
+            onWebClientUpdate(client, i);
+            break;
+          }
+        }
+
         for (size_t i = 0; i < clients.size(); i++) {
           struct MinecraftClient *client = &clients[i];
           if (fd == client->fd) {
