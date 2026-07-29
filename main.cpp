@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -430,9 +431,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
                               "</body>"
                               "</html>";
 
-      write(client->fd, response, sizeof(response) - 1);
-
-      epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, nullptr);
+      sendto(client->fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
       close(client->fd);
       web_clients.erase(web_clients.begin() + client_index);
       return;
@@ -455,11 +454,8 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
                             "</body>"
                             "</html>";
 
-    write(client->fd, response, sizeof(response) - 1);
-
     std::cout << "token " << token << " " << "state " << state << std::endl;
-
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, nullptr);
+    sendto(client->fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
     close(client->fd);
     web_clients.erase(web_clients.begin() + client_index);
     return;
@@ -549,27 +545,20 @@ int main() {
         ev.data.fd = webclientfd;
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webclientfd, &ev);
       } else {
-        bool handled = false;
-
         for (size_t i = 0; i < web_clients.size(); i++) {
           struct WebClient *client = &web_clients[i];
           if (fd == client->fd) {
             onWebClientUpdate(client, i);
-            handled = true;
-            break;
+            goto next;
           }
         }
-
-        if (handled)
-          continue;
 
         for (size_t i = 0; i < clients.size(); i++) {
           struct MinecraftClient *client = &clients[i];
           if (fd == client->fd) {
             onClientUpdate(client, i);
           }
-
-          break;
+          goto next;
         }
 
         int action_mask = 0;
@@ -590,6 +579,8 @@ int main() {
         // 3. Проверяем, не завершился ли запрос в результате этого I/O
         // check_completed_requests();
       }
+
+    next:;
     }
   }
 

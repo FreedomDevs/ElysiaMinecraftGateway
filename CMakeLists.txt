@@ -26,9 +26,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(CURL REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wall -Wextra -pedantic")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 
 add_executable(ElysiaMinecraftGateway ${SRC_FILES} "${CMAKE_CURRENT_BINARY_DIR}/dialog")
-target_link_libraries(ElysiaMinecraftGateway PRIVATE CURL::libcurl)
+target_link_libraries(ElysiaMinecraftGateway PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)

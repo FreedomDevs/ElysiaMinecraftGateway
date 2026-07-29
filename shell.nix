@@ -8,6 +8,7 @@ pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
     llvmPackages.clang-tools
     cmake
     ninja
+    nlohmann_json
   ];
 
   buildInputs = with pkgs; [
