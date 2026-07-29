@@ -413,6 +413,31 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
       }
     }
 
+    if (token.empty() || state.empty()) {
+      const char response[] = "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/html; charset=utf-8\r\n"
+                              "Connection: close\r\n"
+                              "\r\n"
+                              "<!DOCTYPE html>"
+                              "<html>"
+                              "<head>"
+                              "<meta charset=\"utf-8\">"
+                              "<title>Elysia</title>"
+                              "</head>"
+                              "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
+                              "<h1>Возникли проблемы с авторизацией</h1>"
+                              "<p>Обратитесь в тех поддержку платформы.</p>"
+                              "</body>"
+                              "</html>";
+
+      write(client->fd, response, sizeof(response) - 1);
+
+      epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, nullptr);
+      close(client->fd);
+      web_clients.erase(web_clients.begin() + client_index);
+      return;
+    }
+
     const char response[] = "HTTP/1.1 200 OK\r\n"
                             "Content-Type: text/html; charset=utf-8\r\n"
                             "Connection: close\r\n"
