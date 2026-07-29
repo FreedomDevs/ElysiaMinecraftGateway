@@ -364,14 +364,14 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
 
   if (ret < 0 and errno != EAGAIN) {
     perror("Client error(connection closed): ");
-    clients.erase(clients.begin() + client_index);
+    web_clients.erase(web_clients.begin() + client_index);
     close(client->fd);
     return;
   }
 
   if (ret == 0) {
     std::cout << "Client closed connection" << std::endl;
-    clients.erase(clients.begin() + client_index);
+    web_clients.erase(web_clients.begin() + client_index);
     close(client->fd);
     return;
   }
@@ -413,11 +413,35 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
       }
     }
 
-    std::cout << "token " << token << "state " << state << std::endl;
+    const char response[] = "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/html; charset=utf-8\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            "<!DOCTYPE html>"
+                            "<html>"
+                            "<head>"
+                            "<meta charset=\"utf-8\">"
+                            "<title>Elysia</title>"
+                            "</head>"
+                            "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
+                            "<h1>✅ Авторизация успешно завершена</h1>"
+                            "<p>Теперь вернитесь в Minecraft.</p>"
+                            "<p>Вход будет продолжен автоматически.</p>"
+                            "</body>"
+                            "</html>";
+
+    write(client->fd, response, sizeof(response) - 1);
+
+    std::cout << "token " << token << " " << "state " << state << std::endl;
+
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, nullptr);
+    close(client->fd);
+    web_clients.erase(web_clients.begin() + client_index);
+    return;
 
   } catch (const std::exception &e) {
     std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
-    clients.erase(clients.begin() + client_index);
+    web_clients.erase(web_clients.begin() + client_index);
     close(client->fd);
   }
 }
@@ -500,13 +524,19 @@ int main() {
         ev.data.fd = webclientfd;
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webclientfd, &ev);
       } else {
+        bool handled = false;
+
         for (size_t i = 0; i < web_clients.size(); i++) {
           struct WebClient *client = &web_clients[i];
           if (fd == client->fd) {
             onWebClientUpdate(client, i);
+            handled = true;
             break;
           }
         }
+
+        if (handled)
+          continue;
 
         for (size_t i = 0; i < clients.size(); i++) {
           struct MinecraftClient *client = &clients[i];
