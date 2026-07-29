@@ -16,6 +16,7 @@
 #include <iostream>
 #include <netinet/in.h>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <sys/epoll.h>
@@ -26,6 +27,7 @@
 #include <vector>
 
 constexpr unsigned short PORT = 25565;
+constexpr unsigned short WEB_PORT = 8090;
 
 enum class ConnectionState { HandShake, Status, Login, Configuration, Play };
 
@@ -35,6 +37,8 @@ struct MinecraftClient {
   std::string domain;
   std::vector<unsigned char> buf;
   bool isLoginSuccess;
+
+  std::string elysaiAuthState;
 };
 
 std::vector<MinecraftClient> clients;
@@ -69,6 +73,57 @@ static inline void readAndWriteDataPack() {
   close(filefd);
 
   dialog = std::span<char>(addr, sb.st_size);
+}
+
+std::string generateToken() {
+  static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                     "abcdefghijklmnopqrstuvwxyz"
+                                     "0123456789";
+
+  static std::random_device rd;
+  static std::mt19937 rng(rd());
+  static std::uniform_int_distribution<size_t> dist(0, sizeof(alphabet) - 2);
+
+  std::string token;
+  token.reserve(8);
+
+  for (int i = 0; i < 8; ++i)
+    token += alphabet[dist(rng)];
+
+  return token;
+}
+
+// Очень хрупкая хуйня
+bool patchUrl(std::vector<unsigned char> &packet, std::string_view newUrl) {
+  const std::array<unsigned char, 6> key = {0x08, 0x00, 0x03, 'u', 'r', 'l'};
+
+  auto it = std::search(packet.begin(), packet.end(), key.begin(), key.end());
+
+  if (it == packet.end())
+    return false;
+
+  size_t pos = std::distance(packet.begin(), it) + key.size();
+
+  if (pos + 2 > packet.size())
+    return false;
+
+  uint16_t oldLen = (static_cast<uint16_t>(packet[pos]) << 8) | packet[pos + 1];
+
+  pos += 2;
+
+  if (pos + oldLen > packet.size())
+    return false;
+
+  packet.erase(packet.begin() + pos, packet.begin() + pos + oldLen);
+
+  packet.insert(packet.begin() + pos, newUrl.begin(), newUrl.end());
+
+  uint16_t newLen = static_cast<uint16_t>(newUrl.size());
+
+  packet[pos - 2] = static_cast<unsigned char>(newLen >> 8);
+  packet[pos - 1] = static_cast<unsigned char>(newLen & 0xFF);
+
+  return true;
 }
 
 static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
@@ -162,9 +217,16 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       client->state = ConnectionState::Configuration;
 
+      client->elysaiAuthState = generateToken();
+
+      std::vector<unsigned char> packet(reinterpret_cast<unsigned char *>(dialog.data()),
+                                        reinterpret_cast<unsigned char *>(dialog.data()) + dialog.size());
+
+      patchUrl(packet, "https://localhost:3000/auth?client_id=game&state=" + client->elysaiAuthState);
+
       PacketWriter writer;
 
-      writer.writeArray(std::span<unsigned char>{reinterpret_cast<unsigned char *>(dialog.data()), dialog.size()});
+      writer.writeArray(std::span<unsigned char>(packet));
       writer.setPacketId(18);
       writer.writeUncompressed();
       write(client->fd, writer.getData().data(), writer.getData().size());
@@ -288,6 +350,7 @@ int main() {
   readAndWriteDataPack();
   int tcpfd = initTcp(PORT);
   std::cout << "Запущен сокет на порту " << PORT << std::endl;
+  // int webTcpFd = initTcp(WEB_PORT);
 
   epoll_fd = epoll_create1(O_CLOEXEC);
   timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
