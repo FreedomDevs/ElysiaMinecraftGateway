@@ -15,9 +15,10 @@
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
+#include <nlohmann/json.hpp>
 #include <optional>
-#include <random>
 #include <span>
+#include <spanstream>
 #include <sstream>
 #include <stdexcept>
 #include <sys/epoll.h>
@@ -39,19 +40,30 @@ struct MinecraftClient {
   std::string domain;
   std::vector<unsigned char> buf;
   bool isLoginSuccess;
-
-  std::string elysaiAuthState;
 };
 
 struct WebClient {
   int fd;
-  std::vector<unsigned char> buf;
+};
+
+struct RequestContext {
+  std::string token;
+  std::string response_body;
+  bool is_check_refresh;
+  int res_fd;
+  struct curl_slist *headers = nullptr;
+
+  ~RequestContext() {
+    if (headers) {
+      curl_slist_free_all(headers);
+    }
+  }
 };
 
 std::vector<MinecraftClient> clients;
 std::vector<WebClient> web_clients;
 
-static std::span<char> dialog;
+static std::span<unsigned char> dialog;
 
 int epoll_fd;
 int timer_fd;
@@ -80,58 +92,7 @@ static inline void readAndWriteDataPack() {
 
   close(filefd);
 
-  dialog = std::span<char>(addr, sb.st_size);
-}
-
-std::string generateToken() {
-  static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                     "abcdefghijklmnopqrstuvwxyz"
-                                     "0123456789";
-
-  static std::random_device rd;
-  static std::mt19937 rng(rd());
-  static std::uniform_int_distribution<size_t> dist(0, sizeof(alphabet) - 2);
-
-  std::string token;
-  token.reserve(8);
-
-  for (int i = 0; i < 8; ++i)
-    token += alphabet[dist(rng)];
-
-  return token;
-}
-
-// Очень хрупкая хуйня
-bool patchUrl(std::vector<unsigned char> &packet, std::string_view newUrl) {
-  const std::array<unsigned char, 6> key = {0x08, 0x00, 0x03, 'u', 'r', 'l'};
-
-  auto it = std::search(packet.begin(), packet.end(), key.begin(), key.end());
-
-  if (it == packet.end())
-    return false;
-
-  size_t pos = std::distance(packet.begin(), it) + key.size();
-
-  if (pos + 2 > packet.size())
-    return false;
-
-  uint16_t oldLen = (static_cast<uint16_t>(packet[pos]) << 8) | packet[pos + 1];
-
-  pos += 2;
-
-  if (pos + oldLen > packet.size())
-    return false;
-
-  packet.erase(packet.begin() + pos, packet.begin() + pos + oldLen);
-
-  packet.insert(packet.begin() + pos, newUrl.begin(), newUrl.end());
-
-  uint16_t newLen = static_cast<uint16_t>(newUrl.size());
-
-  packet[pos - 2] = static_cast<unsigned char>(newLen >> 8);
-  packet[pos - 1] = static_cast<unsigned char>(newLen & 0xFF);
-
-  return true;
+  dialog = std::span<unsigned char>((unsigned char *)addr, sb.st_size);
 }
 
 static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
@@ -225,16 +186,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       client->state = ConnectionState::Configuration;
 
-      client->elysaiAuthState = generateToken();
-
-      std::vector<unsigned char> packet(reinterpret_cast<unsigned char *>(dialog.data()),
-                                        reinterpret_cast<unsigned char *>(dialog.data()) + dialog.size());
-
-      patchUrl(packet, "https://localhost:3000/auth?client_id=game&state=" + client->elysaiAuthState);
-
       PacketWriter writer;
-
-      writer.writeArray(std::span<unsigned char>(packet));
+      writer.writeArray(dialog);
       writer.setPacketId(18);
       writer.writeUncompressed();
       write(client->fd, writer.getData().data(), writer.getData().size());
@@ -266,15 +219,15 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
 
   if (ret < 0 and errno != EAGAIN) {
     perror("Client error(connection closed): ");
-    clients.erase(clients.begin() + client_index);
     close(client->fd);
+    clients.erase(clients.begin() + client_index);
     return;
   }
 
   if (ret == 0) {
     std::cout << "Client closed connection" << std::endl;
-    clients.erase(clients.begin() + client_index);
     close(client->fd);
+    clients.erase(clients.begin() + client_index);
     return;
   }
 
@@ -296,8 +249,8 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
     }
   } catch (const std::exception &e) {
     std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
-    clients.erase(clients.begin() + client_index);
     close(client->fd);
+    clients.erase(clients.begin() + client_index);
   }
 }
 
@@ -354,45 +307,119 @@ static int cb_timer_action(CURLM *multi, long timeout_ms, void *userp) {
   return 0;
 }
 
+static inline void check_completed_requests() {
+  CURLMsg *msg = nullptr;
+  int msgs_left = 0;
+
+  // Вычитываем все завершившиеся запросы из очереди cURL
+  while ((msg = curl_multi_info_read(multi_handle, &msgs_left))) {
+    if (msg->msg == CURLMSG_DONE) {
+      CURL *easy_handle = msg->easy_handle;
+      CURLcode result = msg->data.result;
+
+      // 1. Достаем наш контекст с токеном обратно!
+      RequestContext *ctx = nullptr;
+      curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &ctx);
+
+      if (result == CURLE_OK) {
+        long response_code = 0;
+        curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
+
+        std::cout << "Запрос завершен! HTTP status: " << response_code << "\n";
+        std::cout << "Токен: " << ctx->token << "\n";
+        std::cout << "Is refresh: " << ctx->is_check_refresh << "\n";
+        std::cout << "fd: " << ctx->res_fd << "\n";
+        std::cout << "Ответ от сервера: " << ctx->response_body << "\n";
+
+        if (ctx->is_check_refresh) {
+          const char response[] = "HTTP/1.1 200 OK\r\n"
+                                  "Content-Type: text/html; charset=utf-8\r\n"
+                                  "Connection: close\r\n"
+                                  "\r\n"
+                                  "<!DOCTYPE html>"
+                                  "<html>"
+                                  "<head>"
+                                  "<meta charset=\"utf-8\">"
+                                  "<title>Elysia</title>"
+                                  "</head>"
+                                  "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
+                                  "<h1>✅ Авторизация успешно завершена</h1>"
+                                  "<p>Теперь вернитесь в Minecraft.</p>"
+                                  "<p>Вход будет продолжен автоматически.</p>"
+                                  "</body>"
+                                  "</html>";
+
+          sendto(ctx->res_fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+          close(ctx->res_fd);
+          for (auto i = web_clients.begin(); i < web_clients.end(); i++) {
+            if (i->fd == ctx->res_fd) {
+              web_clients.erase(i);
+              break;
+            }
+          }
+        }
+      } else {
+        std::cerr << "Ошибка cURL: " << curl_easy_strerror(result) << "\n";
+      }
+
+      // 2. ОБЯЗАТЕЛЬНО: удаляем handle из multi и чистим память
+      curl_multi_remove_handle(multi_handle, easy_handle);
+      curl_easy_cleanup(easy_handle);
+      delete ctx; // Удаляем созданный контекст
+    }
+  }
+}
+
+size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+  size_t total_size = size * nmemb;
+  auto *ctx = static_cast<RequestContext *>(userdata);
+
+  // Дописываем пришедшие байты в наш response_body
+  ctx->response_body.append(ptr, total_size);
+
+  return total_size;
+}
+
 static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
-  std::string token, state;
+  std::string token;
 
   long ret;
   char temp_buf[4096];
-  while ((ret = read(client->fd, temp_buf, sizeof(temp_buf))) > 0) {
-    client->buf.insert(client->buf.end(), temp_buf, temp_buf + ret);
+  int pos = 0;
+  while ((ret = read(client->fd, temp_buf + pos, sizeof(temp_buf) - pos)) > 0) {
+    pos += ret;
   };
 
   if (ret < 0 and errno != EAGAIN) {
     perror("Client error(connection closed): ");
-    web_clients.erase(web_clients.begin() + client_index);
     close(client->fd);
+    web_clients.erase(web_clients.begin() + client_index);
     return;
   }
 
   if (ret == 0) {
     std::cout << "Client closed connection" << std::endl;
-    web_clients.erase(web_clients.begin() + client_index);
     close(client->fd);
+    web_clients.erase(web_clients.begin() + client_index);
     return;
   }
 
   try {
-    std::string request(client->buf.begin(), client->buf.end());
+    std::string_view request(temp_buf, temp_buf + pos);
 
     ssize_t end = request.find("\r\n");
-    std::string firstLine = request.substr(0, end);
+    std::string_view firstLine = request.substr(0, end);
     ssize_t q = firstLine.find('?');
-    if (q == std::string::npos) {
+    if (q == (long)std::string::npos) {
       return;
     }
 
     size_t http = firstLine.find(" HTTP/", q);
 
-    std::string query = firstLine.substr(q + 1, http - q - 1);
+    std::string_view query = firstLine.substr(q + 1, http - q - 1);
 
     std::vector<std::string> parts;
-    std::stringstream ss(query);
+    std::ispanstream ss(query);
     std::string part;
 
     while (std::getline(ss, part, '&')) {
@@ -406,15 +433,13 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
       while (std::getline(sq, key, '=') && std::getline(sq, value)) {
         if (key == "token") {
           token = value;
-        } else if (key == "state") {
-          state = value;
         } else {
           std::cout << "Неизвестное значение " << part[i] << std::endl;
         }
       }
     }
 
-    if (token.empty() || state.empty()) {
+    if (token.empty()) {
       const char response[] = "HTTP/1.1 200 OK\r\n"
                               "Content-Type: text/html; charset=utf-8\r\n"
                               "Connection: close\r\n"
@@ -437,33 +462,45 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
       return;
     }
 
-    const char response[] = "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: text/html; charset=utf-8\r\n"
-                            "Connection: close\r\n"
-                            "\r\n"
-                            "<!DOCTYPE html>"
-                            "<html>"
-                            "<head>"
-                            "<meta charset=\"utf-8\">"
-                            "<title>Elysia</title>"
-                            "</head>"
-                            "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
-                            "<h1>✅ Авторизация успешно завершена</h1>"
-                            "<p>Теперь вернитесь в Minecraft.</p>"
-                            "<p>Вход будет продолжен автоматически.</p>"
-                            "</body>"
-                            "</html>";
+    CURL *easy = curl_easy_init();
+    if (!easy)
+      return;
 
-    std::cout << "token " << token << " " << "state " << state << std::endl;
-    sendto(client->fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
-    close(client->fd);
-    web_clients.erase(web_clients.begin() + client_index);
-    return;
+    // 1. Создаём контекст в куче
+    auto *ctx = new RequestContext();
+    ctx->token = token;
+    ctx->is_check_refresh = true;
+    ctx->res_fd = client->fd;
 
+    // 2. Формируем заголовки (если нужно)
+    ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
+
+    nlohmann::json body = {{"refresh_token", token}};
+
+    // 3. Настраиваем curl easy handle
+    curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/check_refresh_token");
+    curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
+
+    std::string payload = body.dump();
+    curl_easy_setopt(easy, CURLOPT_POST, 1L);
+    curl_easy_setopt(easy, CURLOPT_POSTFIELDS, payload.c_str());
+    curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, payload.size());
+
+    // Привязываем коллбэк записи и передаём ctx как userdata
+    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, ctx);
+    curl_easy_setopt(easy, CURLOPT_PRIVATE, ctx);
+
+    // Доп. настройки для неблокирующей работы
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+
+    // 4. Отдаём в multi handle
+    curl_multi_add_handle(multi_handle, easy);
   } catch (const std::exception &e) {
     std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
-    web_clients.erase(web_clients.begin() + client_index);
     close(client->fd);
+    web_clients.erase(web_clients.begin() + client_index);
   }
 }
 
@@ -527,7 +564,7 @@ int main() {
         curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
 
         // 3. Проверяем, не завершился ли какой-то запрос
-        // check_completed_requests();
+        check_completed_requests();
       } else if (fd == webTcpFd) {
         int webclientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (webclientfd < 0) {
@@ -557,8 +594,8 @@ int main() {
           struct MinecraftClient *client = &clients[i];
           if (fd == client->fd) {
             onClientUpdate(client, i);
+            goto next;
           }
-          goto next;
         }
 
         int action_mask = 0;
@@ -577,7 +614,7 @@ int main() {
         curl_multi_socket_action(multi_handle, fd, action_mask, &running_handles);
 
         // 3. Проверяем, не завершился ли запрос в результате этого I/O
-        // check_completed_requests();
+        check_completed_requests();
       }
 
     next:;
