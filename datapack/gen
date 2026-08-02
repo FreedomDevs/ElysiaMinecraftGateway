@@ -40,7 +40,7 @@ dialog_tag = Compound({
         }),
         "action": Compound({
             "type": String("open_url"),
-            "url": String("http://localhost:3000/auth?client_id=game")
+            "url": String("https:///sso.elysiac.fun/?client_id=game")
         })
     }),
     "pause": Byte(1)  # Заставляет игру встать на паузу (для одиночки) или заблокировать задний фон

@@ -1,5 +1,7 @@
 #include "network/initSocket.h"
 #include "network/packets/Handshake.hpp"
+#include "network/packets/configuration/StoreCookie.hpp"
+#include "network/packets/configuration/Transfer.hpp"
 #include "network/packets/login/LoginAcknowledged.hpp"
 #include "network/packets/login/LoginStart.hpp"
 #include "network/packets/login/LoginSuccess.hpp"
@@ -12,10 +14,12 @@
 #include <cstring>
 #include <ctime>
 #include <curl/multi.h>
+#include <exception>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <span>
 #include <spanstream>
@@ -34,12 +38,22 @@ constexpr unsigned short WEB_PORT = 8090;
 
 enum class ConnectionState { HandShake, Status, Login, Configuration, Play };
 
+struct Server {
+  std::string host;
+  uint16_t port;
+};
+
+std::unordered_map<std::string, struct Server> servers{{"Surv", {"localhost", 25566}}};
+
 struct MinecraftClient {
   int fd;
   ConnectionState state;
   std::string domain;
+  in6_addr addr;
+  std::string username;
+  std::string routed_server;
+  bool send_dialog;
   std::vector<unsigned char> buf;
-  bool isLoginSuccess;
 };
 
 struct WebClient {
@@ -49,6 +63,7 @@ struct WebClient {
 struct RequestContext {
   std::string token;
   std::string response_body;
+  std::string serverName;
   bool is_check_refresh;
   int res_fd;
   struct curl_slist *headers = nullptr;
@@ -59,6 +74,62 @@ struct RequestContext {
     }
   }
 };
+
+struct PlayerSession {
+  in6_addr ip;
+  std::string refresh_token;
+  std::chrono::system_clock::time_point expires_at; // Время истечения токена
+};
+
+class TokenStorage {
+private:
+  // username (в нижнем регистре) -> Данные сессии
+  std::unordered_map<std::string, PlayerSession> sessions;
+
+  // Никнеймы в Minecraft нечувствительны к регистру (Player == player)
+  static std::string to_lower(std::string str) {
+    std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::tolower(c); });
+    return str;
+  }
+
+public:
+  // Сохранить или обновить токен игрока
+  void save_token(const std::string &username, in6_addr ip, const std::string &token, std::chrono::seconds ttl) {
+
+    PlayerSession session{ip, token, std::chrono::system_clock::now() + ttl};
+
+    sessions[to_lower(username)] = std::move(session);
+  }
+
+  // Получить и проверить токен
+  std::optional<PlayerSession> get_valid_session(const std::string &username, in6_addr current_ip) {
+    auto key = to_lower(username);
+    auto it = sessions.find(key);
+
+    if (it == sessions.end()) {
+      return std::nullopt; // Игрок не найден
+    }
+
+    const auto &session = it->second;
+
+    // 1. Проверяем совпадение IP
+    if (IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
+      return std::nullopt; // IP изменился (возможная подмена)
+    }
+
+    // 2. Проверяем срок годности токена
+    if (std::chrono::system_clock::now() > session.expires_at) {
+      sessions.erase(it); // Токен просрочен, удаляем
+      return std::nullopt;
+    }
+
+    return session;
+  }
+
+  // Удалить токен (например, при выходе/разлогине)
+  void revoke_token(const std::string &username) { sessions.erase(to_lower(username)); }
+};
+TokenStorage storage;
 
 std::vector<MinecraftClient> clients;
 std::vector<WebClient> web_clients;
@@ -93,6 +164,70 @@ static inline void readAndWriteDataPack() {
   close(filefd);
 
   dialog = std::span<unsigned char>((unsigned char *)addr, sb.st_size);
+}
+
+size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+  size_t total_size = size * nmemb;
+  auto *ctx = static_cast<RequestContext *>(userdata);
+
+  // Дописываем пришедшие байты в наш response_body
+  ctx->response_body.append(ptr, total_size);
+
+  return total_size;
+}
+
+static inline void routePlayer(const std::string &refresh_token, MinecraftClient *client, size_t client_index) {
+  if (client->domain == "localhost") {
+    client->routed_server = "Surv";
+  } else {
+    close(client->fd);
+    clients.erase(clients.begin() + client_index);
+    return;
+  }
+
+  CURL *easy = curl_easy_init();
+  if (!easy)
+    return;
+
+  // 1. Создаём контекст в куче
+  auto *ctx = new RequestContext();
+  ctx->is_check_refresh = false;
+  ctx->serverName = client->routed_server;
+  ctx->res_fd = client->fd;
+
+  // 2. Формируем заголовки (если нужно)
+  ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
+
+  nlohmann::json body = {{"refresh_token", refresh_token}, {"serverName", client->routed_server}};
+
+  // 3. Настраиваем curl easy handle
+  curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/refresh");
+  curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
+
+  std::string payload = body.dump();
+  curl_easy_setopt(easy, CURLOPT_POST, 1L);
+  curl_easy_setopt(easy, CURLOPT_POSTFIELDS, payload.c_str());
+  curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, payload.size());
+
+  // Привязываем коллбэк записи и передаём ctx как userdata
+  curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
+  curl_easy_setopt(easy, CURLOPT_WRITEDATA, ctx);
+  curl_easy_setopt(easy, CURLOPT_PRIVATE, ctx);
+
+  // Доп. настройки для неблокирующей работы
+  curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+
+  // 4. Отдаём в multi handle
+  curl_multi_add_handle(multi_handle, easy);
+}
+
+static inline void sendDialog(int fd) {
+  PacketWriter writer;
+  writer.writeArray(dialog);
+  writer.setPacketId(18);
+  writer.writeUncompressed();
+  write(fd, writer.getData().data(), writer.getData().size());
 }
 
 static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
@@ -175,22 +310,24 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       PacketWriter writer = resp.getPacketWriter();
       writer.writeUncompressed();
       write(client->fd, writer.getData().data(), writer.getData().size());
-      client->isLoginSuccess = true;
+      client->username = req.getUsername();
     } else if (packet.getPacketId() == 3) {
       LoginAcknowledged res;
       res.decode(packet);
 
-      if (!client->isLoginSuccess) {
+      if (client->username.empty()) {
         throw std::runtime_error("Client idet v pered paravoza");
       }
 
       client->state = ConnectionState::Configuration;
 
-      PacketWriter writer;
-      writer.writeArray(dialog);
-      writer.setPacketId(18);
-      writer.writeUncompressed();
-      write(client->fd, writer.getData().data(), writer.getData().size());
+      std::optional<PlayerSession> session = storage.get_valid_session(client->username, client->addr);
+      if (session.has_value()) {
+        routePlayer(session->refresh_token, client, client_index);
+      } else {
+        client->send_dialog = true;
+        sendDialog(client->fd);
+      }
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
@@ -235,8 +372,6 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
     while (true) {
       std::span<unsigned char> view(client->buf.data(), client->buf.size());
       PacketReader reader(view);
-
-      // std::cout << to_hex(client->buf.data(), client->buf.size()) << std::endl;
 
       std::optional<size_t> ret = reader.readUncompressed();
       if (!ret.has_value())
@@ -332,28 +467,129 @@ static inline void check_completed_requests() {
         std::cout << "Ответ от сервера: " << ctx->response_body << "\n";
 
         if (ctx->is_check_refresh) {
-          const char response[] = "HTTP/1.1 200 OK\r\n"
-                                  "Content-Type: text/html; charset=utf-8\r\n"
-                                  "Connection: close\r\n"
-                                  "\r\n"
-                                  "<!DOCTYPE html>"
-                                  "<html>"
-                                  "<head>"
-                                  "<meta charset=\"utf-8\">"
-                                  "<title>Elysia</title>"
-                                  "</head>"
-                                  "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
-                                  "<h1>✅ Авторизация успешно завершена</h1>"
-                                  "<p>Теперь вернитесь в Minecraft.</p>"
-                                  "<p>Вход будет продолжен автоматически.</p>"
-                                  "</body>"
-                                  "</html>";
+          const char err_response[] = "HTTP/1.1 400 Not OK\r\n"
+                                      "Content-Type: text/html; charset=utf-8\r\n"
+                                      "Connection: close\r\n"
+                                      "\r\n"
+                                      "<!DOCTYPE html>"
+                                      "<html>"
+                                      "<head>"
+                                      "<meta charset=\"utf-8\">"
+                                      "<title>Elysia</title>"
+                                      "</head>"
+                                      "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
+                                      "<p>Почему-то не удалось авторизоватся</p>"
+                                      "</body>"
+                                      "</html>";
 
-          sendto(ctx->res_fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
-          close(ctx->res_fd);
+          try {
+            // Парсим строку в объект json
+            nlohmann::json data = nlohmann::json::parse(ctx->response_body);
+
+            std::string username = data.at("username");
+
+            auto client = clients.end();
+            for (auto i = clients.begin(); i < clients.end(); i++) {
+              if (i->username == username) {
+                client = i;
+                break;
+              }
+            }
+
+            if (client == clients.end()) {
+              sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+              close(ctx->res_fd);
+              goto clean;
+            }
+
+            storage.save_token(username, client->addr, ctx->token, std::chrono::seconds(30 * 24 * 60 * 60));
+            routePlayer(ctx->token, &*client, client - clients.begin());
+          } catch (const std::exception &e) {
+            std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
+
+            sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+            close(ctx->res_fd);
+            goto clean;
+          }
+
+          { // Иначе будет ошибка в goto
+            const char response[] = "HTTP/1.1 200 OK\r\n"
+                                    "Content-Type: text/html; charset=utf-8\r\n"
+                                    "Connection: close\r\n"
+                                    "\r\n"
+                                    "<!DOCTYPE html>"
+                                    "<html>"
+                                    "<head>"
+                                    "<meta charset=\"utf-8\">"
+                                    "<title>Elysia</title>"
+                                    "</head>"
+                                    "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
+                                    "<h1>✅ Авторизация успешно завершена</h1>"
+                                    "<p>Теперь вернитесь в Minecraft.</p>"
+                                    "<p>Вход будет продолжен автоматически.</p>"
+                                    "</body>"
+                                    "</html>";
+
+            sendto(ctx->res_fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+            close(ctx->res_fd);
+          }
+
+        clean:
           for (auto i = web_clients.begin(); i < web_clients.end(); i++) {
             if (i->fd == ctx->res_fd) {
               web_clients.erase(i);
+              break;
+            }
+          }
+        } else {
+          try {
+            // Парсим строку в объект json
+            nlohmann::json data = nlohmann::json::parse(ctx->response_body);
+
+            std::string token = data.at("token");
+
+            auto client = clients.end();
+            for (auto i = clients.begin(); i < clients.end(); i++) {
+              if (i->fd == ctx->res_fd) {
+                client = i;
+                break;
+              }
+            }
+
+            if (client == clients.end()) {
+              close(ctx->res_fd);
+              goto clean1;
+            }
+
+            StoreCookie packet;
+            packet.encode("eauth:eauth-jwt", token);
+            PacketWriter packet1writer = packet.getPacketWriter();
+            packet1writer.writeUncompressed();
+
+            write(client->fd, packet1writer.getData().data(), packet1writer.getData().size());
+
+            Transfer packet2;
+            packet2.encode(servers[client->routed_server].host, servers[client->routed_server].port);
+            PacketWriter packet2writer = packet.getPacketWriter();
+            packet2writer.writeUncompressed();
+
+            write(client->fd, packet2writer.getData().data(), packet2writer.getData().size());
+            close(client->fd);
+          } catch (const std::exception &e) {
+            std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
+
+            for (auto i = clients.begin(); i < clients.end(); i++) {
+              if (i->fd == ctx->res_fd) {
+                storage.revoke_token(i->username);
+              }
+            }
+            close(ctx->res_fd);
+            goto clean1;
+          }
+        clean1:
+          for (auto i = clients.begin(); i < clients.end(); i++) {
+            if (i->fd == ctx->res_fd) {
+              clients.erase(i);
               break;
             }
           }
@@ -368,16 +604,6 @@ static inline void check_completed_requests() {
       delete ctx; // Удаляем созданный контекст
     }
   }
-}
-
-size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  size_t total_size = size * nmemb;
-  auto *ctx = static_cast<RequestContext *>(userdata);
-
-  // Дописываем пришедшие байты в наш response_body
-  ctx->response_body.append(ptr, total_size);
-
-  return total_size;
 }
 
 static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
@@ -475,7 +701,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     // 2. Формируем заголовки (если нужно)
     ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
 
-    nlohmann::json body = {{"refresh_token", token}};
+    nlohmann::json body = {{"refresh_token", token}, {"request_username", true}};
 
     // 3. Настраиваем curl easy handle
     curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/check_refresh_token");
@@ -538,7 +764,10 @@ int main() {
       uint32_t event = events[i].events;
 
       if (fd == tcpfd) {
-        int clientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        sockaddr_in6 client_addr{};
+        socklen_t addr_len = sizeof(client_addr);
+
+        int clientfd = accept4(fd, reinterpret_cast<sockaddr *>(&client_addr), &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (clientfd < 0) {
           perror("client error");
           continue;
@@ -547,6 +776,7 @@ int main() {
         struct MinecraftClient client;
         client.fd = clientfd;
         client.state = ConnectionState::HandShake;
+        client.addr = client_addr.sin6_addr;
         printf("client %d connected\n", clientfd);
 
         clients.push_back(client);
