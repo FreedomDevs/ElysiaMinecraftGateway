@@ -757,6 +757,9 @@ int main() {
 
   epoll_fd = epoll_create1(O_CLOEXEC);
   timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  int timer2_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+
+  struct itimerspec ts = {};
 
   struct epoll_event ev;
   ev.events = EPOLLIN;
@@ -771,11 +774,17 @@ int main() {
   ev.data.fd = timer_fd;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev);
 
+  ev.events = EPOLLIN;
+  ev.data.fd = timer2_fd;
+  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer2_fd, &ev);
+
   multi_handle = curl_multi_init();
   curl_multi_setopt(multi_handle, CURLMOPT_SOCKETDATA, nullptr);
   curl_multi_setopt(multi_handle, CURLMOPT_SOCKETFUNCTION, cb_socket_action);
   curl_multi_setopt(multi_handle, CURLMOPT_TIMERDATA, nullptr);
   curl_multi_setopt(multi_handle, CURLMOPT_TIMERFUNCTION, cb_timer_action);
+
+  const uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
   struct epoll_event events[32];
   while (1) {
@@ -806,17 +815,33 @@ int main() {
         ev.events = EPOLLIN;
         ev.data.fd = clientfd;
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, clientfd, &ev);
+
+        if (ts.it_interval.tv_sec == 0) {
+          ts.it_value.tv_sec = 20;
+          ts.it_interval.tv_sec = 20;
+          timerfd_settime(timer2_fd, 0, &ts, NULL);
+        }
       } else if (fd == timer_fd) {
-        // 1. Обязательно "прочитываем" timerfd, чтобы сбросить его готовность в epoll
+        uint64_t expirations;
+        read(timer_fd, &expirations, sizeof(expirations));
+        int running_handles = 0;
+        curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
+        check_completed_requests();
+      } else if (fd == timer2_fd) {
         uint64_t expirations;
         read(timer_fd, &expirations, sizeof(expirations));
 
-        // 2. Сообщаем curl, что время вышло!
-        int running_handles = 0;
-        curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
-
-        // 3. Проверяем, не завершился ли какой-то запрос
-        check_completed_requests();
+        for (size_t i = 0; i < clients.size(); i++) {
+          MinecraftClient *client = clients.data() + i;
+          if (client->state == ConnectionState::Configuration) {
+            ssize_t ret = write(client->fd, keepalivepacket, sizeof(keepalivepacket));
+            if (ret == -1 || ret != sizeof(keepalivepacket)) {
+              close(client->fd);
+              clients.erase(clients.begin() + i);
+              i--;
+            }
+          }
+        }
       } else if (fd == webTcpFd) {
         int webclientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (webclientfd < 0) {
