@@ -4,14 +4,11 @@
 #include "../../PacketWriter.hpp"
 
 class StatusResponse : public BasePacket {
-private:
-  PacketWriter writer;
-
 public:
-  void encode(std::string statusdata) {
+  static PacketWriter encode(std::string statusdata) {
+    PacketWriter writer;
     writer.writeString(statusdata);
     writer.setPacketId(0);
+    return writer;
   };
-
-  PacketWriter getPacketWriter() { return writer; }
 };

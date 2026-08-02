@@ -10,6 +10,7 @@
 #include "network/packets/status/StatusRequest.hpp"
 #include "network/packets/status/StatusResponse.hpp"
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -62,6 +63,7 @@ struct WebClient {
 
 struct RequestContext {
   std::string token;
+  std::string payload;
   std::string response_body;
   std::string serverName;
   bool is_check_refresh;
@@ -198,16 +200,21 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   // 2. Формируем заголовки (если нужно)
   ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
 
-  nlohmann::json body = {{"refresh_token", refresh_token}, {"serverName", client->routed_server}};
+  int out_len = 0;
+  char *decoded = curl_easy_unescape(multi_handle, refresh_token.c_str(), refresh_token.length(), &out_len);
+  std::string clean_token(decoded, out_len);
+  curl_free(decoded);
+
+  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", client->routed_server}};
 
   // 3. Настраиваем curl easy handle
   curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/refresh");
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
-  std::string payload = body.dump();
+  ctx->payload = body.dump();
   curl_easy_setopt(easy, CURLOPT_POST, 1L);
-  curl_easy_setopt(easy, CURLOPT_POSTFIELDS, payload.c_str());
-  curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, payload.size());
+  curl_easy_setopt(easy, CURLOPT_POSTFIELDS, ctx->payload.c_str());
+  curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, ctx->payload.size());
 
   // Привязываем коллбэк записи и передаём ctx как userdata
   curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
@@ -257,8 +264,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       std::cout << "Получен Status" << std::endl;
 
-      StatusResponse resp;
-      resp.encode(R"(
+      PacketWriter writer = StatusResponse::encode(R"(
                   {
     "version": {
         "name": "1.21.11",
@@ -281,7 +287,6 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 }
                   )");
 
-      PacketWriter writer = resp.getPacketWriter();
       writer.writeUncompressed();
 
       write(client->fd, writer.getData().data(), writer.getData().size());
@@ -289,13 +294,12 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       StatusPing req;
       req.decode(packet);
 
-      StatusPong resp;
-      resp.encode(req.getPayload());
-
-      PacketWriter writer = resp.getPacketWriter();
+      PacketWriter writer = StatusPong::encode(req.getPayload());
       writer.writeUncompressed();
 
-      write(client->fd, writer.getData().data(), writer.getData().size());
+      sendto(client->fd, writer.getData().data(), writer.getData().size(), MSG_NOSIGNAL | MSG_MORE, 0, 0);
+      close(client->fd);
+      clients.erase(clients.begin() + client_index);
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
@@ -347,7 +351,6 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 }
 
 static inline void onClientUpdate(MinecraftClient *client, size_t client_index) {
-
   long ret;
   char temp_buf[4096];
   while ((ret = read(client->fd, temp_buf, sizeof(temp_buf))) > 0) {
@@ -390,6 +393,7 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
 }
 
 static int cb_socket_action(CURL *easy, curl_socket_t s, int action, void *userp, void *socketp) {
+  std::cout << "Socketaction" << std::endl;
   epoll_event ev{};
   ev.data.fd = s;
 
@@ -416,6 +420,7 @@ static int cb_socket_action(CURL *easy, curl_socket_t s, int action, void *userp
 }
 
 static int cb_timer_action(CURLM *multi, long timeout_ms, void *userp) {
+  std::cout << "Timeraction" << std::endl;
   // struct itimerspec задает, через сколько сработает timerfd
   struct itimerspec its{};
 
@@ -474,6 +479,7 @@ static inline void check_completed_requests() {
                                       "<!DOCTYPE html>"
                                       "<html>"
                                       "<head>"
+                                      "<link rel=\"icon\" href=\"data:,\">"
                                       "<meta charset=\"utf-8\">"
                                       "<title>Elysia</title>"
                                       "</head>"
@@ -486,7 +492,7 @@ static inline void check_completed_requests() {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
 
-            std::string username = data.at("username");
+            std::string username = data.at("data").at("username");
 
             auto client = clients.end();
             for (auto i = clients.begin(); i < clients.end(); i++) {
@@ -497,7 +503,7 @@ static inline void check_completed_requests() {
             }
 
             if (client == clients.end()) {
-              sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+              sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_MORE, 0, 0);
               close(ctx->res_fd);
               goto clean;
             }
@@ -507,7 +513,7 @@ static inline void check_completed_requests() {
           } catch (const std::exception &e) {
             std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
 
-            sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+            sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_MORE, 0, 0);
             close(ctx->res_fd);
             goto clean;
           }
@@ -520,6 +526,7 @@ static inline void check_completed_requests() {
                                     "<!DOCTYPE html>"
                                     "<html>"
                                     "<head>"
+                                    "<link rel=\"icon\" href=\"data:,\">"
                                     "<meta charset=\"utf-8\">"
                                     "<title>Elysia</title>"
                                     "</head>"
@@ -546,7 +553,7 @@ static inline void check_completed_requests() {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
 
-            std::string token = data.at("token");
+            std::string token = data.at("data").at("token");
 
             auto client = clients.end();
             for (auto i = clients.begin(); i < clients.end(); i++) {
@@ -570,7 +577,7 @@ static inline void check_completed_requests() {
 
             Transfer packet2;
             packet2.encode(servers[client->routed_server].host, servers[client->routed_server].port);
-            PacketWriter packet2writer = packet.getPacketWriter();
+            PacketWriter packet2writer = packet2.getPacketWriter();
             packet2writer.writeUncompressed();
 
             write(client->fd, packet2writer.getData().data(), packet2writer.getData().size());
@@ -637,6 +644,9 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     std::string_view firstLine = request.substr(0, end);
     ssize_t q = firstLine.find('?');
     if (q == (long)std::string::npos) {
+      std::cout << "Invalid request" << std::endl;
+      close(client->fd);
+      web_clients.erase(web_clients.begin() + client_index);
       return;
     }
 
@@ -673,6 +683,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
                               "<!DOCTYPE html>"
                               "<html>"
                               "<head>"
+                              "<link rel=\"icon\" href=\"data:,\">"
                               "<meta charset=\"utf-8\">"
                               "<title>Elysia</title>"
                               "</head>"
@@ -701,16 +712,21 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     // 2. Формируем заголовки (если нужно)
     ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
 
-    nlohmann::json body = {{"refresh_token", token}, {"request_username", true}};
+    int out_len = 0;
+    char *decoded = curl_easy_unescape(multi_handle, token.c_str(), token.length(), &out_len);
+    std::string clean_token(decoded, out_len);
+    curl_free(decoded);
+
+    nlohmann::json body = {{"refresh_token", clean_token}, {"request_username", true}};
 
     // 3. Настраиваем curl easy handle
     curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/check_refresh_token");
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
-    std::string payload = body.dump();
+    ctx->payload = body.dump();
     curl_easy_setopt(easy, CURLOPT_POST, 1L);
-    curl_easy_setopt(easy, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, payload.size());
+    curl_easy_setopt(easy, CURLOPT_POSTFIELDS, ctx->payload.c_str());
+    curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, ctx->payload.size());
 
     // Привязываем коллбэк записи и передаём ctx как userdata
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
@@ -731,6 +747,8 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
 }
 
 int main() {
+  std::signal(SIGPIPE, SIG_IGN);
+
   readAndWriteDataPack();
   int tcpfd = initTcp(PORT);
   std::cout << "Запущен сокет на порту " << PORT << std::endl;
@@ -748,6 +766,10 @@ int main() {
   ev.events = EPOLLIN;
   ev.data.fd = webTcpFd;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webTcpFd, &ev);
+
+  ev.events = EPOLLIN;
+  ev.data.fd = timer_fd;
+  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev);
 
   multi_handle = curl_multi_init();
   curl_multi_setopt(multi_handle, CURLMOPT_SOCKETDATA, nullptr);

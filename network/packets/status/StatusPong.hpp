@@ -4,14 +4,11 @@
 #include "../../PacketWriter.hpp"
 
 class StatusPong : public BasePacket {
-private:
-  PacketWriter writer;
-
 public:
-  void encode(long payload) {
+  static PacketWriter encode(long payload) {
+    PacketWriter writer;
     writer.writeLong(payload);
     writer.setPacketId(1);
+    return writer;
   };
-
-  PacketWriter getPacketWriter() { return writer; }
 };
