@@ -39,12 +39,12 @@ constexpr unsigned short WEB_PORT = 8090;
 
 enum class ConnectionState { HandShake, Status, Login, Configuration, Play };
 
-struct Server {
-  std::string host;
-  uint16_t port;
-};
+// struct Server {
+//   std::string host;
+//   uint16_t port;
+// };
 
-std::unordered_map<std::string, struct Server> servers{{"Surv", {"localhost", 25566}}};
+// std::unordered_map<std::string, struct Server> servers{{"Surv", {"localhost", 25566}}};
 
 struct MinecraftClient {
   int fd;
@@ -82,6 +82,138 @@ struct PlayerSession {
   std::string refresh_token;
   std::chrono::system_clock::time_point expires_at; // Время истечения токена
 };
+
+struct ConfigServer {
+  std::uint16_t port;
+  std::string host;
+};
+
+class Config {
+private:
+  std::string configFile;
+  std::unordered_map<std::string, std::string> routes;
+  std::unordered_map<std::string, struct ConfigServer> servers;
+
+  std::uint16_t webPort, gamePort;
+
+  void loadConfig() {
+  st:;
+    int filefd = open(configFile.c_str(), O_RDONLY);
+    if (filefd >= 0) {
+      std::cout << "Инициалитзирую конфиг файл" << std::endl;
+      struct stat st;
+      if (fstat(filefd, &st) < 0) {
+        close(filefd);
+
+        std::cerr << "Ошибка с конфиг файлом" << std::endl;
+        return;
+      }
+
+      ssize_t size = st.st_size;
+
+      std::vector<char> buf(size);
+      ssize_t n = read(filefd, buf.data(), buf.size());
+
+      if (n < 0) {
+        close(filefd);
+        std::cerr << "Ошибка с конфиг файлом" << std::endl;
+        return;
+      }
+      close(filefd);
+
+      std::string jsonText(buf.begin(), buf.end());
+      try {
+        nlohmann::json j = nlohmann::json::parse(jsonText);
+
+        gamePort = j["gamePort"];
+        webPort = j["webPort"];
+
+        for (auto &el : j["routes"].items()) {
+          routes[el.key()] = el.value();
+        }
+
+        for (auto &el : j["servers"].items()) {
+          ConfigServer server;
+          for (auto &eq : j["servers"][el.key()].items()) {
+            if (eq.key() == "port") {
+              server.port = eq.value();
+            } else if (eq.key() == "host") {
+              server.host = eq.value();
+            }
+          }
+
+          servers[el.key()] = server;
+        }
+
+        std::cout << "Инициализация конфиг файла завершена!" << std::endl;
+
+      } catch (const std::exception &e) {
+        std::cerr << e.what() << std::endl;
+      }
+    } else {
+      std::cout << "Конфиг файла нету создаём..." << std::endl;
+      int newFilefd = open(configFile.c_str(), O_CREAT | O_WRONLY, 0644);
+      if (newFilefd < 0) {
+        return;
+      }
+
+      nlohmann::json j;
+      j["gamePort"] = 25565;
+      j["webPort"] = 8090;
+
+      j["routes"]["localhost"] = "Surv";
+      j["servers"]["Surv"]["host"] = "localhost";
+      j["servers"]["Surv"]["port"] = 25566;
+
+      std::string data = j.dump(2);
+      write(newFilefd, data.c_str(), data.size());
+      close(newFilefd);
+      goto st;
+    }
+  }
+
+public:
+  Config(std::string fileName) {
+    configFile = fileName;
+    loadConfig();
+  }
+
+  uint16_t getWebPort() { return webPort; }
+  uint16_t getGamePort() { return gamePort; }
+
+  std::optional<std::string> getServerNameForDomain(std::string domain) {
+    if (routes.contains(domain)) {
+      return routes[domain];
+    }
+    return std::nullopt;
+  }
+
+  std::optional<ConfigServer> getServerForName(std::string serverName) {
+    if (!servers.contains(serverName)) {
+      return std::nullopt;
+    }
+
+    return servers[serverName];
+  }
+
+  std::optional<struct ConfigServer> getServerForDomain(std::string domain) {
+    auto serverName = getServerNameForDomain(domain);
+
+    if (!serverName) {
+      return std::nullopt;
+    }
+
+    auto server = getServerForName(serverName.value());
+
+    if (!server) {
+      return std::nullopt;
+    }
+
+    return server;
+  };
+};
+
+Config *config;
 
 class TokenStorage {
 private:
@@ -179,8 +311,10 @@ size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 static inline void routePlayer(const std::string &refresh_token, MinecraftClient *client, size_t client_index) {
-  if (client->domain == "localhost") {
-    client->routed_server = "Surv";
+  auto serverName = config->getServerNameForDomain(client->domain);
+
+  if (serverName) {
+    client->routed_server = serverName.value();
   } else {
     close(client->fd);
     clients.erase(clients.begin() + client_index);
@@ -576,7 +710,14 @@ static inline void check_completed_requests() {
             write(client->fd, packet1writer.getData().data(), packet1writer.getData().size());
 
             Transfer packet2;
-            packet2.encode(servers[client->routed_server].host, servers[client->routed_server].port);
+
+            auto serv = config->getServerForName(client->routed_server);
+            if (!serv) {
+              std::cerr << "Сервер " << client->routed_server << " не найден в конфиге" << std::endl;
+              close(client->fd);
+              goto clean1;
+            }
+            packet2.encode(serv.value().host, serv.value().port);
             PacketWriter packet2writer = packet2.getPacketWriter();
             packet2writer.writeUncompressed();
 
@@ -747,13 +888,15 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
 }
 
 int main() {
+  config = new Config("config.json");
+
   std::signal(SIGPIPE, SIG_IGN);
 
   readAndWriteDataPack();
-  int tcpfd = initTcp(PORT);
-  std::cout << "Запущен сокет на порту " << PORT << std::endl;
-  int webTcpFd = initTcp(WEB_PORT);
-  std::cout << "Запущен веб сокет на порту " << WEB_PORT << std::endl;
+  int tcpfd = initTcp(config->getGamePort());
+  std::cout << "Запущен сокет на порту " << config->getGamePort() << std::endl;
+  int webTcpFd = initTcp(config->getWebPort());
+  std::cout << "Запущен веб сокет на порту " << config->getWebPort() << std::endl;
 
   epoll_fd = epoll_create1(O_CLOEXEC);
   timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
