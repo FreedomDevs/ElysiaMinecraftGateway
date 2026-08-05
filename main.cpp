@@ -34,17 +34,7 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr unsigned short PORT = 25565;
-constexpr unsigned short WEB_PORT = 8090;
-
 enum class ConnectionState { HandShake, Status, Login, Configuration, Play };
-
-// struct Server {
-//   std::string host;
-//   uint16_t port;
-// };
-
-// std::unordered_map<std::string, struct Server> servers{{"Surv", {"localhost", 25566}}};
 
 struct MinecraftClient {
   int fd;
@@ -95,6 +85,7 @@ private:
   std::unordered_map<std::string, struct ConfigServer> servers;
 
   std::uint16_t webPort, gamePort;
+  std::string checkRefreshTokenUrl, refreshUrl;
 
   void loadConfig() {
   st:;
@@ -127,6 +118,8 @@ private:
 
         gamePort = j["gamePort"];
         webPort = j["webPort"];
+        checkRefreshTokenUrl = j["check_refresh_token_url"];
+        refreshUrl = j["refresh_url"];
 
         for (auto &el : j["routes"].items()) {
           routes[el.key()] = el.value();
@@ -161,6 +154,9 @@ private:
       j["gamePort"] = 25565;
       j["webPort"] = 8090;
 
+      j["check_refresh_token_url"] = "https://fin1-services.elysiac.fun/auth/check_refresh_token";
+      j["refresh_url"] = "https://fin1-services.elysiac.fun/auth/refresh";
+
       j["routes"]["localhost"] = "Surv";
       j["servers"]["Surv"]["host"] = "localhost";
       j["servers"]["Surv"]["port"] = 25566;
@@ -180,6 +176,8 @@ public:
 
   uint16_t getWebPort() { return webPort; }
   uint16_t getGamePort() { return gamePort; }
+  const std::string getCheckRefreshTokenUrl() { return checkRefreshTokenUrl; }
+  const std::string getRefreshUrl() { return refreshUrl; }
 
   std::optional<std::string> getServerNameForDomain(std::string domain) {
     if (routes.contains(domain)) {
@@ -342,7 +340,7 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", client->routed_server}};
 
   // 3. Настраиваем curl easy handle
-  curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/refresh");
+  curl_easy_setopt(easy, CURLOPT_URL, config->getRefreshUrl().c_str());
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
   ctx->payload = body.dump();
@@ -379,7 +377,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     HandShake handshake;
     handshake.decode(packet);
 
-    if (handshake.getServerPort() != PORT) {
+    if (handshake.getServerPort() != config->getGamePort()) {
       throw std::runtime_error("Incorrect connection port: " + std::to_string(handshake.getServerPort()));
     }
 
@@ -861,7 +859,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     nlohmann::json body = {{"refresh_token", clean_token}, {"request_username", true}};
 
     // 3. Настраиваем curl easy handle
-    curl_easy_setopt(easy, CURLOPT_URL, "https://fin1-services.elysiac.fun/auth/check_refresh_token");
+    curl_easy_setopt(easy, CURLOPT_URL, config->getCheckRefreshTokenUrl().c_str());
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
     ctx->payload = body.dump();
