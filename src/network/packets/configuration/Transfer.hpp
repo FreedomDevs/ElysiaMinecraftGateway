@@ -5,15 +5,12 @@
 #include <cstdint>
 
 class Transfer : public BasePacket {
-private:
-  PacketWriter writer;
-
 public:
-  void encode(std::string domain, uint16_t port) {
+  static PacketWriter encode(std::string domain, uint16_t port) {
+    PacketWriter writer;
+    writer.writePacketId(11);
     writer.writeString(domain);
     writer.writeVarInt(port);
-    writer.setPacketId(11);
+    return writer;
   };
-
-  PacketWriter getPacketWriter() { return writer; }
 };

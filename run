@@ -1,4 +1,4 @@
 #!/bin/sh
-./compile
-cd build
+. ./compile
+cd build || exit 1
 ./ElysiaMinecraftGateway

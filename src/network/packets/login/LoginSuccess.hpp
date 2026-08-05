@@ -9,6 +9,8 @@ private:
 
 public:
   void encode(long UUID_part1, long UUID_part2, std::string username) {
+    writer.writePacketId(2);
+
     // GameProfile
     writer.writeLong(UUID_part1);
     writer.writeLong(UUID_part2);
@@ -17,8 +19,6 @@ public:
 
     writer.writeLong(UUID_part1);
     writer.writeLong(UUID_part2);
-
-    writer.setPacketId(2);
   };
 
   PacketWriter getPacketWriter() { return writer; }

@@ -9,9 +9,11 @@ pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
     cmake
     ninja
     nlohmann_json
+    spdlog
   ];
 
   buildInputs = with pkgs; [
+    fmt
     curl
   ];
 

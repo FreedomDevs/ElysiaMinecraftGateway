@@ -16,7 +16,7 @@ private:
 
 public:
   PacketReader(std::span<unsigned char> data) : data(data), index(0), packet_id(-1) {}
-  std::optional<size_t> readUncompressed() {
+  std::optional<size_t> readUncompressed(size_t max_size = pow(2, 23)) {
     size_t packet_size;
     try {
       packet_size = this->readVarInt();
@@ -28,7 +28,7 @@ public:
       throw e;
     }
 
-    if (packet_size > pow(2, 23)) {
+    if (packet_size > max_size) {
       throw std::runtime_error("Packet size is too long.");
     }
 

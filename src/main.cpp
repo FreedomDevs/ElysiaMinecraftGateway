@@ -1,6 +1,7 @@
-#include "HexUtil.hpp"
+#include "config.hpp"
+#include "embed.hpp"
 #include "network/PacketWriter.hpp"
-#include "network/initSocket.h"
+#include "network/netutils.hpp"
 #include "network/packets/Handshake.hpp"
 #include "network/packets/configuration/StoreCookie.hpp"
 #include "network/packets/configuration/Transfer.hpp"
@@ -10,7 +11,6 @@
 #include "network/packets/status/StatusPing.hpp"
 #include "network/packets/status/StatusPong.hpp"
 #include "network/packets/status/StatusRequest.hpp"
-#include "network/packets/status/StatusResponse.hpp"
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
@@ -28,6 +28,7 @@
 #include <optional>
 #include <span>
 #include <spanstream>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <stdexcept>
 #include <sys/epoll.h>
@@ -35,12 +36,23 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <vector>
+
+#include "epoll_fd.hpp"
+#include "network/curl_init.hpp"
+#include "network/sockets.hpp"
+#include "resolv.hpp"
+
+Config config = Config("config.json");
+static iovec iov[4]; // Нужен 4
 
 enum class ConnectionState : unsigned char { HandShake, Status, Login, Configuration, Play };
 
 enum class StatusReadState : unsigned char { Connection, Read };
+
+static char temp_buf[2048];
 
 struct MinecraftClient {
   int fd;
@@ -49,10 +61,10 @@ struct MinecraftClient {
   std::vector<unsigned char> sendbuf;
   StatusReadState statusread_state;
   ConnectionState state;
-  std::string domain;
   in6_addr addr;
   std::string username;
-  std::string routed_server;
+  std::string *routed_server;
+  Config::ConfigServer *routed_server_config;
   bool send_dialog;
   std::vector<unsigned char> buf;
 };
@@ -76,146 +88,6 @@ struct RequestContext {
     }
   }
 };
-
-struct ConfigServer {
-  std::uint16_t port;
-  std::string host;
-};
-
-class Config {
-private:
-  std::string configFile;
-  std::unordered_map<std::string, std::string> routes;
-  std::unordered_map<std::string, struct ConfigServer> servers;
-
-  std::uint16_t webPort, gamePort;
-  std::string checkRefreshTokenUrl, refreshUrl;
-
-  void loadConfig() {
-  st:;
-    int filefd = open(configFile.c_str(), O_RDONLY);
-    if (filefd >= 0) {
-      std::cout << "Инициалитзирую конфиг файл" << std::endl;
-      struct stat st;
-      if (fstat(filefd, &st) < 0) {
-        close(filefd);
-
-        std::cerr << "Ошибка с конфиг файлом" << std::endl;
-        return;
-      }
-
-      ssize_t size = st.st_size;
-
-      std::vector<char> buf(size);
-      ssize_t n = read(filefd, buf.data(), buf.size());
-
-      if (n < 0) {
-        close(filefd);
-        std::cerr << "Ошибка с конфиг файлом" << std::endl;
-        return;
-      }
-      close(filefd);
-
-      std::string jsonText(buf.begin(), buf.end());
-      try {
-        nlohmann::json j = nlohmann::json::parse(jsonText);
-
-        gamePort = j["gamePort"];
-        webPort = j["webPort"];
-        checkRefreshTokenUrl = j["check_refresh_token_url"];
-        refreshUrl = j["refresh_url"];
-
-        for (auto &el : j["routes"].items()) {
-          routes[el.key()] = el.value();
-        }
-
-        for (auto &el : j["servers"].items()) {
-          ConfigServer server;
-          for (auto &eq : j["servers"][el.key()].items()) {
-            if (eq.key() == "port") {
-              server.port = eq.value();
-            } else if (eq.key() == "host") {
-              server.host = eq.value();
-            }
-          }
-
-          servers[el.key()] = server;
-        }
-
-        std::cout << "Инициализация конфиг файла завершена!" << std::endl;
-
-      } catch (const std::exception &e) {
-        std::cerr << e.what() << std::endl;
-      }
-    } else {
-      std::cout << "Конфиг файла нету создаём..." << std::endl;
-      int newFilefd = open(configFile.c_str(), O_CREAT | O_WRONLY, 0644);
-      if (newFilefd < 0) {
-        return;
-      }
-
-      nlohmann::json j;
-      j["gamePort"] = 25565;
-      j["webPort"] = 8090;
-
-      j["check_refresh_token_url"] = "https://fin1-services.elysiac.fun/auth/check_refresh_token";
-      j["refresh_url"] = "https://fin1-services.elysiac.fun/auth/refresh";
-
-      j["routes"]["localhost"] = "Surv";
-      j["servers"]["Surv"]["host"] = "localhost";
-      j["servers"]["Surv"]["port"] = 25566;
-
-      std::string data = j.dump(2);
-      write(newFilefd, data.c_str(), data.size());
-      close(newFilefd);
-      goto st;
-    }
-  }
-
-public:
-  Config(std::string fileName) {
-    configFile = fileName;
-    loadConfig();
-  }
-
-  uint16_t getWebPort() { return webPort; }
-  uint16_t getGamePort() { return gamePort; }
-  const std::string getCheckRefreshTokenUrl() { return checkRefreshTokenUrl; }
-  const std::string getRefreshUrl() { return refreshUrl; }
-
-  std::optional<std::string> getServerNameForDomain(std::string domain) {
-    if (routes.contains(domain)) {
-      return routes[domain];
-    }
-    return std::nullopt;
-  }
-
-  std::optional<ConfigServer> getServerForName(std::string serverName) {
-    if (!servers.contains(serverName)) {
-      return std::nullopt;
-    }
-
-    return servers[serverName];
-  }
-
-  std::optional<struct ConfigServer> getServerForDomain(std::string domain) {
-    auto serverName = getServerNameForDomain(domain);
-
-    if (!serverName) {
-      return std::nullopt;
-    }
-
-    auto server = getServerForName(serverName.value());
-
-    if (!server) {
-      return std::nullopt;
-    }
-
-    return server;
-  };
-};
-
-Config *config;
 
 struct PlayerSession {
   in6_addr ip;
@@ -276,38 +148,6 @@ TokenStorage storage;
 std::vector<MinecraftClient> clients;
 std::vector<WebClient> web_clients;
 
-static std::span<unsigned char> dialog;
-
-int epoll_fd;
-int timer_fd;
-CURLM *multi_handle;
-
-static inline void readAndWriteDataPack() {
-  int filefd = open("dialog", O_RDONLY);
-  if (filefd == -1) {
-    perror("Не удалось открывать файл");
-    _exit(1);
-  }
-
-  struct stat sb;
-  if (fstat(filefd, &sb) == -1) {
-    std::perror("fstat error");
-    close(filefd);
-    _exit(1);
-  }
-
-  char *addr = static_cast<char *>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, filefd, 0));
-  if (addr == MAP_FAILED) {
-    std::perror("mmap error");
-    close(filefd);
-    _exit(1);
-  }
-
-  close(filefd);
-
-  dialog = std::span<unsigned char>((unsigned char *)addr, sb.st_size);
-}
-
 size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
   size_t total_size = size * nmemb;
   auto *ctx = static_cast<RequestContext *>(userdata);
@@ -318,17 +158,7 @@ size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
   return total_size;
 }
 
-static inline void routePlayer(const std::string &refresh_token, MinecraftClient *client, size_t client_index) {
-  auto serverName = config->getServerNameForDomain(client->domain);
-
-  if (serverName) {
-    client->routed_server = serverName.value();
-  } else {
-    close(client->fd);
-    clients.erase(clients.begin() + client_index);
-    return;
-  }
-
+static inline void routePlayer(const std::string &refresh_token, MinecraftClient *client) {
   CURL *easy = curl_easy_init();
   if (!easy)
     return;
@@ -336,7 +166,7 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   // 1. Создаём контекст в куче
   auto *ctx = new RequestContext();
   ctx->is_check_refresh = false;
-  ctx->serverName = client->routed_server;
+  ctx->serverName = *client->routed_server;
   ctx->res_fd = client->fd;
 
   // 2. Формируем заголовки (если нужно)
@@ -347,10 +177,10 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   std::string clean_token(decoded, out_len);
   curl_free(decoded);
 
-  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", client->routed_server}};
+  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", *client->routed_server}};
 
   // 3. Настраиваем curl easy handle
-  curl_easy_setopt(easy, CURLOPT_URL, config->getRefreshUrl().c_str());
+  curl_easy_setopt(easy, CURLOPT_URL, config.get_refresh_url().c_str());
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
   ctx->payload = body.dump();
@@ -371,45 +201,6 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   curl_multi_add_handle(multi_handle, easy);
 }
 
-static inline void sendDialog(int fd) {
-  PacketWriter writer;
-  writer.writeArray(dialog);
-  writer.setPacketId(18);
-  writer.writeUncompressed();
-  write(fd, writer.getData().data(), writer.getData().size());
-}
-
-typedef struct {
-  struct sockaddr_storage addr; // Работает и под sockaddr_in, и под sockaddr_in6
-  socklen_t addr_len;           // Длина (sizeof(sockaddr_in) или sizeof(sockaddr_in6))
-  int family;                   // AF_INET или AF_INET6
-} ResolvedAddress;
-
-int resolve_host(const char *host, int port, ResolvedAddress *out) {
-  struct addrinfo hints, *res;
-  char port_str[6];
-  snprintf(port_str, sizeof(port_str), "%d", port);
-
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;     // AF_UNSPEC = поддерживаем и IPv4, и IPv6!
-  hints.ai_socktype = SOCK_STREAM; // TCP
-  hints.ai_flags = AI_ADDRCONFIG;  // Запрашивать v6 только если в системе есть IPv6-интерфейсы
-
-  int status = getaddrinfo(host, port_str, &hints, &res);
-  if (status != 0) {
-    fprintf(stderr, "Ошибка резолва %s: %s\n", host, gai_strerror(status));
-    return -1;
-  }
-
-  // Сохраняем адрес и его размер
-  memcpy(&out->addr, res->ai_addr, res->ai_addrlen);
-  out->addr_len = res->ai_addrlen;
-  out->family = res->ai_family;
-
-  freeaddrinfo(res);
-  return 0;
-}
-
 static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
   if (client->state == ConnectionState::HandShake) {
     if (packet.getPacketId() != 0)
@@ -418,11 +209,28 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     HandShake handshake;
     handshake.decode(packet);
 
-    if (handshake.getServerPort() != config->getGamePort()) {
+    if (handshake.getServerPort() != config.get_game_port()) {
       throw std::runtime_error("Incorrect connection port: " + std::to_string(handshake.getServerPort()));
     }
 
-    client->domain = handshake.getServerAddress();
+    auto server_name = config.get_servername_by_domain(handshake.getServerAddress());
+    if (server_name) {
+      client->routed_server = server_name.value();
+    } else {
+      close(client->fd);
+      clients.erase(clients.begin() + client_index);
+      return;
+    }
+
+    auto server_config = config.get_server_by_name(*client->routed_server);
+    if (server_config) {
+      client->routed_server_config = server_config.value();
+    } else {
+      close(client->fd);
+      clients.erase(clients.begin() + client_index);
+      return;
+    }
+
     std::cout << "Получен Handshake, адрес: " << handshake.getServerAddress() << ", версия протокола: " << handshake.getProtocolVersion()
               << ", причина подключения: " << (int)handshake.getConnectionReason() << std::endl;
 
@@ -438,14 +246,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       std::cout << "Получен Status" << std::endl;
 
-      auto serverName = config->getServerNameForDomain(client->domain);
-      if (!serverName) {
-        throw std::runtime_error("Не удалось найти сервер куда идём");
-      }
-
       ResolvedAddress res_addr;
-      if (resolve_host(config->getServerForName(serverName.value()).value().host.c_str(),
-                       config->getServerForName(serverName.value()).value().port, &res_addr) < 0) {
+      if (resolve_host(client->routed_server_config->host.c_str(), client->routed_server_config->port, &res_addr) < 0) {
         throw std::runtime_error("Не удалось отрезолвить домен типо");
       }
 
@@ -456,7 +258,6 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       }
       client->statusread_fd = sock_fd;
       client->statusread_state = StatusReadState::Connection;
-      client->routed_server = serverName.value();
 
       int res = connect(sock_fd, (struct sockaddr *)&res_addr.addr, res_addr.addr_len);
       if (res < 0 && errno != EINPROGRESS) {
@@ -480,9 +281,13 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       req.decode(packet);
 
       PacketWriter writer = StatusPong::encode(req.getPayload());
-      writer.writeUncompressed();
+      writer.generate_iovec(iov);
 
-      sendto(client->fd, writer.getData().data(), writer.getData().size(), MSG_NOSIGNAL | MSG_MORE, 0, 0);
+      msghdr msg;
+      msg.msg_iov = iov;
+      msg.msg_iovlen = 2;
+
+      sendmsg(client->fd, &msg, MSG_MORE);
       close(client->fd);
       clients.erase(clients.begin() + client_index);
     } else {
@@ -497,8 +302,9 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       resp.encode(req.getUUID1(), req.getUUID2(), req.getUsername());
 
       PacketWriter writer = resp.getPacketWriter();
-      writer.writeUncompressed();
-      write(client->fd, writer.getData().data(), writer.getData().size());
+      writer.generate_iovec(iov);
+      writev(client->fd, iov, 2);
+
       client->username = req.getUsername();
     } else if (packet.getPacketId() == 3) {
       LoginAcknowledged res;
@@ -512,10 +318,10 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       std::optional<PlayerSession> session = storage.get_valid_session(client->username, client->addr);
       if (session.has_value()) {
-        routePlayer(session->refresh_token, client, client_index);
+        routePlayer(session->refresh_token, client);
       } else {
         client->send_dialog = true;
-        sendDialog(client->fd);
+        write(client->fd, embedded::dialog.data(), embedded::dialog.size());
       }
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
@@ -537,7 +343,6 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
 static inline void onClientUpdate(MinecraftClient *client, size_t client_index) {
   long ret;
-  char temp_buf[4096];
   while ((ret = read(client->fd, temp_buf, sizeof(temp_buf))) > 0) {
     client->buf.insert(client->buf.end(), temp_buf, temp_buf + ret);
   };
@@ -561,7 +366,8 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       std::span<unsigned char> view(client->buf.data(), client->buf.size());
       PacketReader reader(view);
 
-      std::optional<size_t> ret = reader.readUncompressed();
+      std::optional<size_t> ret =
+          client->state == ConnectionState::HandShake ? reader.readUncompressed(260) : reader.readUncompressed(1000);
       if (!ret.has_value())
         break;
 
@@ -577,61 +383,6 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       close(client->statusread_fd);
     clients.erase(clients.begin() + client_index);
   }
-}
-
-static int cb_socket_action(CURL *easy, curl_socket_t s, int action, void *userp, void *socketp) {
-  std::cout << "Socketaction" << std::endl;
-  epoll_event ev{};
-  ev.data.fd = s;
-
-  if (action == CURL_POLL_IN) {
-    ev.events = EPOLLIN;
-  } else if (action == CURL_POLL_OUT) {
-    ev.events = EPOLLOUT;
-  } else if (action == CURL_POLL_INOUT) {
-    ev.events = EPOLLIN | EPOLLOUT;
-  } else if (action == CURL_POLL_REMOVE) {
-    // Удаляем сокет из epoll
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, s, nullptr);
-    return 0;
-  }
-
-  // Если сокет уже регистрировался ранее (socketp != nullptr), делаем MOD, иначе ADD
-  int op = (socketp != nullptr) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-  epoll_ctl(epoll_fd, op, s, &ev);
-
-  // Сохраняем маркер, что сокет зарегистрирован
-  curl_multi_assign(multi_handle, s, (void *)1);
-
-  return 0;
-}
-
-static int cb_timer_action(CURLM *multi, long timeout_ms, void *userp) {
-  std::cout << "Timeraction" << std::endl;
-  // struct itimerspec задает, через сколько сработает timerfd
-  struct itimerspec its{};
-
-  if (timeout_ms < 0) {
-    // timeout_ms < 0 означает, что curl просит отменить текущий таймер
-    // Передаем нулевой its — это выключает timerfd
-    timerfd_settime(timer_fd, 0, &its, nullptr);
-
-  } else {
-    // Если curl просит 0 мс, взводим на 1 нс (минимально возможное время),
-    // чтобы epoll_wait сработал сразу на следующей итерации
-    if (timeout_ms == 0) {
-      its.it_value.tv_nsec = 1;
-    } else {
-      // Переводим миллисекунды в секунды и наносекунды
-      its.it_value.tv_sec = timeout_ms / 1000;
-      its.it_value.tv_nsec = (timeout_ms % 1000) * 1000000;
-    }
-
-    // Заряжаем timerfd!
-    timerfd_settime(timer_fd, 0, &its, nullptr);
-  }
-
-  return 0;
 }
 
 static inline void check_completed_requests() {
@@ -659,22 +410,6 @@ static inline void check_completed_requests() {
         std::cout << "Ответ от сервера: " << ctx->response_body << "\n";
 
         if (ctx->is_check_refresh) {
-          const char err_response[] = "HTTP/1.1 400 Not OK\r\n"
-                                      "Content-Type: text/html; charset=utf-8\r\n"
-                                      "Connection: close\r\n"
-                                      "\r\n"
-                                      "<!DOCTYPE html>"
-                                      "<html>"
-                                      "<head>"
-                                      "<link rel=\"icon\" href=\"data:,\">"
-                                      "<meta charset=\"utf-8\">"
-                                      "<title>Elysia</title>"
-                                      "</head>"
-                                      "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
-                                      "<p>Почему-то не удалось авторизоватся</p>"
-                                      "</body>"
-                                      "</html>";
-
           try {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
@@ -690,44 +425,23 @@ static inline void check_completed_requests() {
             }
 
             if (client == clients.end()) {
-              sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_MORE, 0, 0);
+              send(ctx->res_fd, &embedded::not_ok_html, embedded::not_ok_html.size(), MSG_MORE);
               close(ctx->res_fd);
               goto clean;
             }
 
             storage.save_token(username, client->addr, ctx->token, std::chrono::seconds(30 * 24 * 60 * 60));
-            routePlayer(ctx->token, &*client, client - clients.begin());
+            routePlayer(ctx->token, &*client);
           } catch (const std::exception &e) {
             std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
 
-            sendto(ctx->res_fd, err_response, sizeof(err_response) - 1, MSG_MORE, 0, 0);
+            send(ctx->res_fd, &embedded::not_ok_html, embedded::not_ok_html.size(), MSG_MORE);
             close(ctx->res_fd);
             goto clean;
           }
 
-          { // Иначе будет ошибка в goto
-            const char response[] = "HTTP/1.1 200 OK\r\n"
-                                    "Content-Type: text/html; charset=utf-8\r\n"
-                                    "Connection: close\r\n"
-                                    "\r\n"
-                                    "<!DOCTYPE html>"
-                                    "<html>"
-                                    "<head>"
-                                    "<link rel=\"icon\" href=\"data:,\">"
-                                    "<meta charset=\"utf-8\">"
-                                    "<title>Elysia</title>"
-                                    "</head>"
-                                    "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
-                                    "<h1>✅ Авторизация успешно завершена</h1>"
-                                    "<p>Теперь вернитесь в Minecraft.</p>"
-                                    "<p>Вход будет продолжен автоматически.</p>"
-                                    "</body>"
-                                    "</html>";
-
-            sendto(ctx->res_fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
-            close(ctx->res_fd);
-          }
-
+          send(ctx->res_fd, &embedded::ok_html, embedded::ok_html.size(), MSG_MORE);
+          close(ctx->res_fd);
         clean:
           for (auto i = web_clients.begin(); i < web_clients.end(); i++) {
             if (i->fd == ctx->res_fd) {
@@ -755,26 +469,15 @@ static inline void check_completed_requests() {
               goto clean1;
             }
 
-            StoreCookie packet;
-            packet.encode("eauth:eauth-jwt", token);
-            PacketWriter packet1writer = packet.getPacketWriter();
-            packet1writer.writeUncompressed();
+            PacketWriter packetwriter = StoreCookie::encode("eauth:eauth-jwt", token);
+            packetwriter.generate_iovec(iov);
+            packetwriter = Transfer::encode(client->routed_server_config->host, client->routed_server_config->port);
+            packetwriter.generate_iovec(iov + 2);
 
-            write(client->fd, packet1writer.getData().data(), packet1writer.getData().size());
-
-            Transfer packet2;
-
-            auto serv = config->getServerForName(client->routed_server);
-            if (!serv) {
-              std::cerr << "Сервер " << client->routed_server << " не найден в конфиге" << std::endl;
-              close(client->fd);
-              goto clean1;
-            }
-            packet2.encode(serv.value().host, serv.value().port);
-            PacketWriter packet2writer = packet2.getPacketWriter();
-            packet2writer.writeUncompressed();
-
-            write(client->fd, packet2writer.getData().data(), packet2writer.getData().size());
+            struct msghdr msg{};
+            msg.msg_iov = iov;
+            msg.msg_iovlen = 4; // 4 io мы использовали
+            sendmsg(client->fd, &msg, MSG_MORE);
             close(client->fd);
           } catch (const std::exception &e) {
             std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
@@ -811,7 +514,6 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
   std::string token;
 
   long ret;
-  char temp_buf[4096];
   int pos = 0;
   while ((ret = read(client->fd, temp_buf + pos, sizeof(temp_buf) - pos)) > 0) {
     pos += ret;
@@ -870,24 +572,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     }
 
     if (token.empty()) {
-      const char response[] = "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/html; charset=utf-8\r\n"
-                              "Connection: close\r\n"
-                              "\r\n"
-                              "<!DOCTYPE html>"
-                              "<html>"
-                              "<head>"
-                              "<link rel=\"icon\" href=\"data:,\">"
-                              "<meta charset=\"utf-8\">"
-                              "<title>Elysia</title>"
-                              "</head>"
-                              "<body style=\"font-family:sans-serif;text-align:center;margin-top:100px;\">"
-                              "<h1>Возникли проблемы с авторизацией</h1>"
-                              "<p>Обратитесь в тех поддержку платформы.</p>"
-                              "</body>"
-                              "</html>";
-
-      sendto(client->fd, response, sizeof(response) - 1, MSG_NOSIGNAL | MSG_MORE, 0, 0);
+      send(client->fd, &embedded::not_ok_html, embedded::not_ok_html.size(), MSG_MORE);
       close(client->fd);
       web_clients.erase(web_clients.begin() + client_index);
       return;
@@ -914,7 +599,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     nlohmann::json body = {{"refresh_token", clean_token}, {"request_username", true}};
 
     // 3. Настраиваем curl easy handle
-    curl_easy_setopt(easy, CURLOPT_URL, config->getCheckRefreshTokenUrl().c_str());
+    curl_easy_setopt(easy, CURLOPT_URL, config.get_check_refresh_token_url().c_str());
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
     ctx->payload = body.dump();
@@ -940,48 +625,20 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
   }
 }
 
+constexpr uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+constexpr uint8_t status_request_packet[] = {0x01, 0x00};
+
 int main() {
-  config = new Config("config.json");
-
   std::signal(SIGPIPE, SIG_IGN);
-
-  readAndWriteDataPack();
-  int tcpfd = initTcp(config->getGamePort());
-  std::cout << "Запущен сокет на порту " << config->getGamePort() << std::endl;
-  int webTcpFd = initTcp(config->getWebPort());
-  std::cout << "Запущен веб сокет на порту " << config->getWebPort() << std::endl;
-
   epoll_fd = epoll_create1(O_CLOEXEC);
-  timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-  int timer2_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 
-  struct itimerspec ts = {};
-
-  struct epoll_event ev;
-  ev.events = EPOLLIN;
-  ev.data.fd = tcpfd;
-  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tcpfd, &ev);
-
-  ev.events = EPOLLIN;
-  ev.data.fd = webTcpFd;
-  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webTcpFd, &ev);
-
-  ev.events = EPOLLIN;
-  ev.data.fd = timer_fd;
-  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev);
-
-  ev.events = EPOLLIN;
-  ev.data.fd = timer2_fd;
-  epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer2_fd, &ev);
-
-  multi_handle = curl_multi_init();
-  curl_multi_setopt(multi_handle, CURLMOPT_SOCKETDATA, nullptr);
-  curl_multi_setopt(multi_handle, CURLMOPT_SOCKETFUNCTION, cb_socket_action);
-  curl_multi_setopt(multi_handle, CURLMOPT_TIMERDATA, nullptr);
-  curl_multi_setopt(multi_handle, CURLMOPT_TIMERFUNCTION, cb_timer_action);
-
-  const uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-  const uint8_t status_request_packet[] = {0x01, 0x00};
+  int tcpfd = init_tcp_socket(config.get_game_port());
+  SPDLOG_INFO("Запущен сокет на порту: {}", config.get_game_port());
+  int webTcpFd = init_tcp_socket(config.get_web_port());
+  SPDLOG_INFO("Запущен веб сервер на порту: {}", config.get_web_port());
+  int minecraft_keepalive_timerfd = init_timerfd();
+  struct itimerspec minecraft_keepalive_ts = {};
+  init_curl_or_exit();
 
   struct epoll_event events[32];
   while (1) {
@@ -992,42 +649,38 @@ int main() {
       uint32_t event = events[i].events;
 
       if (fd == tcpfd) {
-        sockaddr_in6 client_addr{};
-        socklen_t addr_len = sizeof(client_addr);
+        struct MinecraftClient client;
+        client.statusread_fd = -1;
+        client.state = ConnectionState::HandShake;
 
-        int clientfd = accept4(fd, reinterpret_cast<sockaddr *>(&client_addr), &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (clientfd < 0) {
-          perror("client error");
+        socklen_t addr_len = sizeof(client.addr);
+
+        client.fd = accept4(fd, (sockaddr *)&client.addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (client.fd < 0) {
+          SPDLOG_ERROR("Client error: {}", std::system_category().message(errno));
           continue;
         }
 
-        struct MinecraftClient client;
-        client.fd = clientfd;
-        client.statusread_fd = -1;
-        client.state = ConnectionState::HandShake;
-        client.addr = client_addr.sin6_addr;
-        printf("client %d connected\n", clientfd);
+        SPDLOG_INFO("client {} connected\n", client.fd);
 
         clients.push_back(client);
 
         ev.events = EPOLLIN;
-        ev.data.fd = clientfd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, clientfd, &ev);
+        ev.data.fd = client.fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &ev);
 
-        if (ts.it_interval.tv_sec == 0) {
-          ts.it_value.tv_sec = 20;
-          ts.it_interval.tv_sec = 20;
-          timerfd_settime(timer2_fd, 0, &ts, NULL);
+        if (minecraft_keepalive_ts.it_interval.tv_sec == 0) {
+          minecraft_keepalive_ts.it_value.tv_sec = 20;
+          minecraft_keepalive_ts.it_interval.tv_sec = 20;
+          timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
         }
-      } else if (fd == timer_fd) {
-        uint64_t expirations;
-        read(timer_fd, &expirations, sizeof(expirations));
+      } else if (fd == curl_timer_fd) {
+        read_timerfd(curl_timer_fd);
         int running_handles = 0;
         curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
         check_completed_requests();
-      } else if (fd == timer2_fd) {
-        uint64_t expirations;
-        read(timer2_fd, &expirations, sizeof(expirations));
+      } else if (fd == minecraft_keepalive_timerfd) {
+        read_timerfd(minecraft_keepalive_timerfd);
 
         for (size_t i = 0; i < clients.size(); i++) {
           MinecraftClient *client = clients.data() + i;
@@ -1083,13 +736,17 @@ int main() {
               goto next;
             }
 
-            PacketWriter handshake = HandShake::encode(client->protocol_version, config->getServerForName(client->routed_server)->host,
-                                                       config->getServerForName(client->routed_server)->port, ConnectionReason::Status);
+            PacketWriter handshake = HandShake::encode(client->protocol_version, client->routed_server_config->host,
+                                                       client->routed_server_config->port, ConnectionReason::Status);
+            handshake.generate_iovec(iov);
+            iov[3].iov_base = (void *)status_request_packet;
+            iov[3].iov_len = sizeof(status_request_packet);
 
-            handshake.writeUncompressed();
-            handshake.getData().insert(handshake.getData().end(), std::begin(status_request_packet), std::end(status_request_packet));
+            msghdr msg;
+            msg.msg_iov = iov;
+            msg.msg_iovlen = 3;
 
-            sendto(client->statusread_fd, handshake.getData().data(), handshake.getData().size(), MSG_MORE, 0, 0);
+            sendmsg(client->statusread_fd, &msg, MSG_MORE);
             shutdown(client->statusread_fd, SHUT_WR);
 
             ev.events = EPOLLIN;
@@ -1108,7 +765,6 @@ int main() {
 
           if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Read) {
             long ret;
-            char temp_buf[4096];
             while ((ret = read(client->statusread_fd, temp_buf, sizeof(temp_buf))) > 0) {
               client->sendbuf.insert(client->sendbuf.end(), temp_buf, temp_buf + ret);
             };
@@ -1181,6 +837,12 @@ int main() {
       }
 
     next:;
+    }
+
+    if (clients.size() == 0 && minecraft_keepalive_ts.it_interval.tv_sec == 20) {
+      minecraft_keepalive_ts.it_value.tv_sec = 0;
+      minecraft_keepalive_ts.it_interval.tv_sec = 0;
+      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
     }
   }
 

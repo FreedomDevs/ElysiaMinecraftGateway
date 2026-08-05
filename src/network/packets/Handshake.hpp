@@ -30,11 +30,11 @@ public:
   static PacketWriter encode(int protocol_version, const std::string &server_address, unsigned short server_port,
                              ConnectionReason connection_reason) {
     PacketWriter writer;
+    writer.writePacketId(0);
     writer.writeVarInt(protocol_version);
     writer.writeString(server_address);
     writer.writeUnsignedShort(server_port);
     writer.writeVarInt((int)connection_reason);
-    writer.setPacketId(0);
 
     return writer;
   }

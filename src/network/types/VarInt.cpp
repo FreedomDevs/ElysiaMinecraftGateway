@@ -29,7 +29,7 @@ int readVarInt(std::span<unsigned char> buffer, size_t &index) {
     if (index == buffer.size())
       throw std::runtime_error("VarInt exceeds buffer limit");
 
-    currentByte = buffer[index++]; // Тут ошибка
+    currentByte = buffer[index++];
 
     value |= (currentByte & 0x7F) << (position++ * 7);
 

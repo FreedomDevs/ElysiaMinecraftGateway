@@ -4,15 +4,12 @@
 #include "../../PacketWriter.hpp"
 
 class StoreCookie : public BasePacket {
-private:
-  PacketWriter writer;
-
 public:
-  void encode(std::string identificator, std::string data) {
+  static PacketWriter encode(std::string identificator, std::string data) {
+    PacketWriter writer;
+    writer.writePacketId(10);
     writer.writeString(identificator);
     writer.writeString(data);
-    writer.setPacketId(10);
+    return writer;
   };
-
-  PacketWriter getPacketWriter() { return writer; }
 };
