@@ -24,7 +24,7 @@ public:
   }
   void writeCompressed() {}
 
-  const std::vector<unsigned char> &getData() { return data; }
+  std::vector<unsigned char> &getData() { return data; }
   void setPacketId(int packet_id) { this->packet_id = packet_id; }
 
   void writeUnsignedShort(unsigned short data) {

@@ -10,4 +10,5 @@ std::string to_hex(const unsigned char *data, size_t length) {
   return oss.str();
 }
 
+std::string to_hex(std::span<unsigned char> data) { return to_hex(data.data(), data.size()); }
 std::string to_hex(std::vector<unsigned char> data) { return to_hex(data.data(), data.size()); }

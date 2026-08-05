@@ -3,14 +3,14 @@
 #include <stdexcept>
 
 namespace String {
-std::string readString(std::span<unsigned char> data, size_t &offset) {
+std::string_view readString(std::span<unsigned char> data, size_t &offset) {
   int stringLength = VarInt::readVarInt(data, offset);
 
   if (data.size() < offset + stringLength) {
     throw std::runtime_error("The string size is larger than the total data.");
   }
 
-  std::string result(data.begin() + offset, data.begin() + offset + stringLength);
+  std::string_view result((const char *)&*(data.begin() + offset), stringLength);
 
   offset += stringLength;
 

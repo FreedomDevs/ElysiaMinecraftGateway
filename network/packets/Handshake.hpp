@@ -1,6 +1,7 @@
 #pragma once
 #include "../BasePacket.hpp"
 #include "../PacketReader.hpp"
+#include "../PacketWriter.hpp"
 #include <stdexcept>
 #include <string>
 
@@ -25,6 +26,18 @@ public:
 
     reader.end();
   };
+
+  static PacketWriter encode(int protocol_version, const std::string &server_address, unsigned short server_port,
+                             ConnectionReason connection_reason) {
+    PacketWriter writer;
+    writer.writeVarInt(protocol_version);
+    writer.writeString(server_address);
+    writer.writeUnsignedShort(server_port);
+    writer.writeVarInt((int)connection_reason);
+    writer.setPacketId(0);
+
+    return writer;
+  }
 
   int getProtocolVersion() { return protocol_version; }
   std::string getServerAddress() { return server_address; }

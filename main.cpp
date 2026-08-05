@@ -1,3 +1,5 @@
+#include "HexUtil.hpp"
+#include "network/PacketWriter.hpp"
 #include "network/initSocket.h"
 #include "network/packets/Handshake.hpp"
 #include "network/packets/configuration/StoreCookie.hpp"
@@ -9,6 +11,7 @@
 #include "network/packets/status/StatusPong.hpp"
 #include "network/packets/status/StatusRequest.hpp"
 #include "network/packets/status/StatusResponse.hpp"
+#include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -18,6 +21,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <iostream>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -34,10 +38,16 @@
 #include <unistd.h>
 #include <vector>
 
-enum class ConnectionState { HandShake, Status, Login, Configuration, Play };
+enum class ConnectionState : unsigned char { HandShake, Status, Login, Configuration, Play };
+
+enum class StatusReadState : unsigned char { Connection, Read };
 
 struct MinecraftClient {
   int fd;
+  int protocol_version;
+  int statusread_fd;
+  std::vector<unsigned char> sendbuf;
+  StatusReadState statusread_state;
   ConnectionState state;
   std::string domain;
   in6_addr addr;
@@ -65,12 +75,6 @@ struct RequestContext {
       curl_slist_free_all(headers);
     }
   }
-};
-
-struct PlayerSession {
-  in6_addr ip;
-  std::string refresh_token;
-  std::chrono::system_clock::time_point expires_at; // Время истечения токена
 };
 
 struct ConfigServer {
@@ -213,6 +217,12 @@ public:
 
 Config *config;
 
+struct PlayerSession {
+  in6_addr ip;
+  std::string refresh_token;
+  std::chrono::system_clock::time_point expires_at; // Время истечения токена
+};
+
 class TokenStorage {
 private:
   // username (в нижнем регистре) -> Данные сессии
@@ -245,7 +255,7 @@ public:
     const auto &session = it->second;
 
     // 1. Проверяем совпадение IP
-    if (IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
+    if (!IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
       return std::nullopt; // IP изменился (возможная подмена)
     }
 
@@ -369,6 +379,37 @@ static inline void sendDialog(int fd) {
   write(fd, writer.getData().data(), writer.getData().size());
 }
 
+typedef struct {
+  struct sockaddr_storage addr; // Работает и под sockaddr_in, и под sockaddr_in6
+  socklen_t addr_len;           // Длина (sizeof(sockaddr_in) или sizeof(sockaddr_in6))
+  int family;                   // AF_INET или AF_INET6
+} ResolvedAddress;
+
+int resolve_host(const char *host, int port, ResolvedAddress *out) {
+  struct addrinfo hints, *res;
+  char port_str[6];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;     // AF_UNSPEC = поддерживаем и IPv4, и IPv6!
+  hints.ai_socktype = SOCK_STREAM; // TCP
+  hints.ai_flags = AI_ADDRCONFIG;  // Запрашивать v6 только если в системе есть IPv6-интерфейсы
+
+  int status = getaddrinfo(host, port_str, &hints, &res);
+  if (status != 0) {
+    fprintf(stderr, "Ошибка резолва %s: %s\n", host, gai_strerror(status));
+    return -1;
+  }
+
+  // Сохраняем адрес и его размер
+  memcpy(&out->addr, res->ai_addr, res->ai_addrlen);
+  out->addr_len = res->ai_addrlen;
+  out->family = res->ai_family;
+
+  freeaddrinfo(res);
+  return 0;
+}
+
 static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
   if (client->state == ConnectionState::HandShake) {
     if (packet.getPacketId() != 0)
@@ -385,6 +426,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     std::cout << "Получен Handshake, адрес: " << handshake.getServerAddress() << ", версия протокола: " << handshake.getProtocolVersion()
               << ", причина подключения: " << (int)handshake.getConnectionReason() << std::endl;
 
+    client->protocol_version = handshake.getProtocolVersion();
     if (handshake.getConnectionReason() == ConnectionReason::Status)
       client->state = ConnectionState::Status;
     else
@@ -396,32 +438,43 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       std::cout << "Получен Status" << std::endl;
 
-      PacketWriter writer = StatusResponse::encode(R"(
-                  {
-    "version": {
-        "name": "1.21.11",
-        "protocol": 774
-    },
-    "players": {
-        "max": 20,
-        "online": 1,
-        "sample": [
-            {
-                "name": "mikinol",
-                "id": "4566e69f-c907-48ee-8d71-d7ba5aa00d20"
-            }
-        ]
-    },
-    "description": {
-        "text": "Hello, world!"
-    },
-    "enforcesSecureChat": false
-}
-                  )");
+      auto serverName = config->getServerNameForDomain(client->domain);
+      if (!serverName) {
+        throw std::runtime_error("Не удалось найти сервер куда идём");
+      }
 
-      writer.writeUncompressed();
+      ResolvedAddress res_addr;
+      if (resolve_host(config->getServerForName(serverName.value()).value().host.c_str(),
+                       config->getServerForName(serverName.value()).value().port, &res_addr) < 0) {
+        throw std::runtime_error("Не удалось отрезолвить домен типо");
+      }
 
-      write(client->fd, writer.getData().data(), writer.getData().size());
+      int sock_fd = socket(res_addr.family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+      if (sock_fd < 0) {
+        perror("status socket");
+        throw std::runtime_error("Status socket failed");
+      }
+      client->statusread_fd = sock_fd;
+      client->statusread_state = StatusReadState::Connection;
+      client->routed_server = serverName.value();
+
+      int res = connect(sock_fd, (struct sockaddr *)&res_addr.addr, res_addr.addr_len);
+      if (res < 0 && errno != EINPROGRESS) {
+        perror("connect");
+        throw std::runtime_error("Ошибка всего говна");
+      }
+
+      struct epoll_event ev;
+      memset(&ev, 0, sizeof(ev));
+
+      // Настраиваем epoll на ожидание готовности к ЗАПИСИ (EPOLLOUT)
+      ev.events = EPOLLOUT | EPOLLONESHOT;
+      ev.data.fd = sock_fd;
+
+      if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_fd, &ev) < 0) {
+        perror("epoll_ctl ADD");
+        throw std::runtime_error("Не удалось чела добавить в epoll");
+      }
     } else if (packet.getPacketId() == 1) {
       StatusPing req;
       req.decode(packet);
@@ -468,7 +521,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
   } else if (client->state == ConnectionState::Configuration) {
-    if (packet.getPacketId() == 0 || packet.getPacketId() == 2) {
+    if (packet.getPacketId() == 0 || packet.getPacketId() == 2 || packet.getPacketId() == 4) {
       return;
     } else if (packet.getPacketId() == 8) {
       std::cout << "Client closed connection";
@@ -520,6 +573,8 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
   } catch (const std::exception &e) {
     std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
     close(client->fd);
+    if (client->statusread_fd)
+      close(client->statusread_fd);
     clients.erase(clients.begin() + client_index);
   }
 }
@@ -926,6 +981,7 @@ int main() {
   curl_multi_setopt(multi_handle, CURLMOPT_TIMERFUNCTION, cb_timer_action);
 
   const uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  const uint8_t status_request_packet[] = {0x01, 0x00};
 
   struct epoll_event events[32];
   while (1) {
@@ -947,6 +1003,7 @@ int main() {
 
         struct MinecraftClient client;
         client.fd = clientfd;
+        client.statusread_fd = -1;
         client.state = ConnectionState::HandShake;
         client.addr = client_addr.sin6_addr;
         printf("client %d connected\n", clientfd);
@@ -970,7 +1027,7 @@ int main() {
         check_completed_requests();
       } else if (fd == timer2_fd) {
         uint64_t expirations;
-        read(timer_fd, &expirations, sizeof(expirations));
+        read(timer2_fd, &expirations, sizeof(expirations));
 
         for (size_t i = 0; i < clients.size(); i++) {
           MinecraftClient *client = clients.data() + i;
@@ -1012,6 +1069,94 @@ int main() {
           struct MinecraftClient *client = &clients[i];
           if (fd == client->fd) {
             onClientUpdate(client, i);
+            goto next;
+          }
+
+          if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Connection) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+              fprintf(stderr, "Соединение НЕ установлено: %s\n", strerror(err));
+              close(client->statusread_fd);
+              close(client->fd);
+              clients.erase(clients.begin() + i);
+              goto next;
+            }
+
+            PacketWriter handshake = HandShake::encode(client->protocol_version, config->getServerForName(client->routed_server)->host,
+                                                       config->getServerForName(client->routed_server)->port, ConnectionReason::Status);
+
+            handshake.writeUncompressed();
+            handshake.getData().insert(handshake.getData().end(), std::begin(status_request_packet), std::end(status_request_packet));
+
+            sendto(client->statusread_fd, handshake.getData().data(), handshake.getData().size(), MSG_MORE, 0, 0);
+            shutdown(client->statusread_fd, SHUT_WR);
+
+            ev.events = EPOLLIN;
+            ev.data.fd = client->statusread_fd;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->statusread_fd, &ev) < 0) {
+              perror("epoll_ctl MOD");
+              close(client->statusread_fd);
+              close(client->fd);
+              clients.erase(clients.begin() + i);
+              goto next;
+            }
+
+            client->statusread_state = StatusReadState::Read;
+            goto next;
+          }
+
+          if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Read) {
+            long ret;
+            char temp_buf[4096];
+            while ((ret = read(client->statusread_fd, temp_buf, sizeof(temp_buf))) > 0) {
+              client->sendbuf.insert(client->sendbuf.end(), temp_buf, temp_buf + ret);
+            };
+
+            if (ret < 0 and errno != EAGAIN) {
+              perror("Client error(connection closed): ");
+              close(client->fd);
+              close(client->statusread_fd);
+              clients.erase(clients.begin() + i);
+              goto next;
+            }
+
+            if (ret == 0) {
+              std::cout << "Client closed connection" << std::endl;
+              close(client->fd);
+              close(client->statusread_fd);
+              clients.erase(clients.begin() + i);
+              goto next;
+            }
+
+            try {
+              std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
+              PacketReader reader(view);
+
+              std::optional<size_t> ret = reader.readUncompressed();
+              if (!ret.has_value())
+                goto next;
+
+              if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
+                close(client->fd);
+                close(client->statusread_fd);
+                clients.erase(clients.begin() + i);
+                goto next;
+              }
+
+              close(client->statusread_fd);
+              write(client->fd, client->sendbuf.data(), client->sendbuf.size());
+              client->statusread_fd = -1;
+              client->sendbuf.clear();
+              client->sendbuf.shrink_to_fit();
+            } catch (const std::exception &e) {
+              std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
+              close(client->fd);
+              close(client->statusread_fd);
+              clients.erase(clients.begin() + i);
+              goto next;
+            }
+
             goto next;
           }
         }

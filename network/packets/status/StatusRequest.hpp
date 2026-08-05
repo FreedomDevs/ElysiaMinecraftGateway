@@ -2,6 +2,7 @@
 
 #include "../../BasePacket.hpp"
 #include "../../PacketReader.hpp"
+#include "../../PacketWriter.hpp"
 
 class StatusRequest : public BasePacket {
 private:

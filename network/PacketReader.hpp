@@ -70,7 +70,7 @@ public:
   }
 
   int readVarInt() { return VarInt::readVarInt(data, index); }
-  std::string readString() { return String::readString(data, index); }
+  std::string_view readString() { return String::readString(data, index); }
 
   void end() {
     if (data.size() != index) {
