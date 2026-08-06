@@ -48,7 +48,7 @@
 Config config = Config("config.json");
 static iovec iov[4]; // Нужен 4
 
-enum class ConnectionState : unsigned char { HandShake, Status, Login, Configuration, Play };
+enum class ConnectionState : unsigned char { HandShake, Status, Login, Configuration, Play, Died };
 
 enum class StatusReadState : unsigned char { Connection, Read };
 
@@ -469,10 +469,10 @@ static inline void check_completed_requests() {
               goto clean1;
             }
 
-            PacketWriter packetwriter = StoreCookie::encode("eauth:eauth-jwt", token);
-            packetwriter.generate_iovec(iov);
-            packetwriter = Transfer::encode(client->routed_server_config->host, client->routed_server_config->port);
-            packetwriter.generate_iovec(iov + 2);
+            PacketWriter packetwriter1 = StoreCookie::encode("eauth:eauth-jwt", token);
+            packetwriter1.generate_iovec(iov);
+            PacketWriter packetwriter2 = Transfer::encode(client->routed_server_config->host, client->routed_server_config->port);
+            packetwriter2.generate_iovec(iov + 2);
 
             struct msghdr msg{};
             msg.msg_iov = iov;
@@ -627,218 +627,217 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
 
 constexpr uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 constexpr uint8_t status_request_packet[] = {0x01, 0x00};
+static struct itimerspec minecraft_keepalive_ts = {};
+int minecraft_keepalive_timerfd;
+int tcpfd;
+int webTcpFd;
+
+void onEpoll(epoll_event *ep_event) {
+  int fd = ep_event->data.fd;
+  uint32_t event = ep_event->events;
+
+  if (fd == tcpfd) {
+    struct MinecraftClient client;
+    client.statusread_fd = -1;
+    client.state = ConnectionState::HandShake;
+
+    socklen_t addr_len = sizeof(client.addr);
+
+    client.fd = accept4(fd, (sockaddr *)&client.addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (client.fd < 0) {
+      SPDLOG_ERROR("Can't accept minecraft connection: {}", std::system_category().message(errno));
+      return;
+    }
+
+    SPDLOG_INFO("Minecraft client connected: ", client.fd);
+    clients.push_back(client);
+
+    ev.events = EPOLLIN;
+    ev.data.fd = client.fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &ev);
+
+    if (minecraft_keepalive_ts.it_interval.tv_sec == 0) {
+      minecraft_keepalive_ts.it_value.tv_sec = 20;
+      minecraft_keepalive_ts.it_interval.tv_sec = 20;
+      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
+    }
+  } else if (fd == webTcpFd) {
+    struct WebClient client;
+    client.fd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (client.fd < 0) {
+      SPDLOG_ERROR("Can't accept web connection: ", std::system_category().message(errno));
+      return;
+    }
+
+    SPDLOG_INFO("Web client connected: {}", client.fd);
+    web_clients.push_back(client);
+
+    ev.events = EPOLLIN;
+    ev.data.fd = client.fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &ev);
+  } else if (fd == curl_timer_fd) {
+    read_timerfd(curl_timer_fd);
+    int running_handles = 0;
+
+    curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
+    check_completed_requests();
+  } else if (fd == minecraft_keepalive_timerfd) {
+    read_timerfd(minecraft_keepalive_timerfd);
+
+    for (auto &client : clients) {
+      if (client.state == ConnectionState::Configuration) {
+        ssize_t ret = write(client.fd, keepalivepacket, sizeof(keepalivepacket));
+        if (ret != sizeof(keepalivepacket)) { // -1 или меньше чем sizeof(keepalivepacket)
+          close(client.fd);
+          client.state = ConnectionState::Died;
+        }
+      }
+    }
+
+    std::erase_if(clients, [](const MinecraftClient &c) { return c.state == ConnectionState::Died; });
+  } else {
+    for (size_t i = 0; i < web_clients.size(); i++) {
+      struct WebClient *client = &web_clients[i];
+      if (fd == client->fd) {
+        onWebClientUpdate(client, i);
+        return;
+      }
+    }
+
+    for (size_t i = 0; i < clients.size(); i++) {
+      struct MinecraftClient *client = &clients[i];
+      if (fd == client->fd) {
+        onClientUpdate(client, i);
+        return;
+      }
+
+      if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Connection) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+          SPDLOG_ERROR("Can't establish connection with backend minecraft server: {}, {}", *client->routed_server,
+                       std::system_category().message(errno));
+          close(client->statusread_fd);
+          close(client->fd);
+          clients.erase(clients.begin() + i);
+          return;
+        }
+
+        PacketWriter handshake = HandShake::encode(client->protocol_version, client->routed_server_config->host,
+                                                   client->routed_server_config->port, ConnectionReason::Status);
+        handshake.generate_iovec(iov);
+        iov[2].iov_base = (void *)status_request_packet;
+        iov[2].iov_len = sizeof(status_request_packet);
+
+        msghdr msg;
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 3;
+
+        sendmsg(client->statusread_fd, &msg, MSG_MORE);
+        shutdown(client->statusread_fd, SHUT_WR);
+
+        ev.events = EPOLLIN;
+        ev.data.fd = client->statusread_fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->statusread_fd, &ev) < 0) {
+          close(client->statusread_fd);
+          close(client->fd);
+          clients.erase(clients.begin() + i);
+          return;
+        }
+
+        client->statusread_state = StatusReadState::Read;
+        return;
+      }
+
+      if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Read) {
+        long ret;
+        while ((ret = read(client->statusread_fd, temp_buf, sizeof(temp_buf))) > 0) {
+          client->sendbuf.insert(client->sendbuf.end(), temp_buf, temp_buf + ret);
+        };
+
+        if (ret < 0 and errno != EAGAIN) {
+          SPDLOG_ERROR("Can't read data from backend minecraft server: {}, {}", *client->routed_server,
+                       std::system_category().message(errno));
+          close(client->fd);
+          close(client->statusread_fd);
+          clients.erase(clients.begin() + i);
+          return;
+        }
+
+        try {
+          std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
+          PacketReader reader(view);
+
+          std::optional<size_t> ret = reader.readUncompressed();
+          if (!ret.has_value())
+            return;
+
+          if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
+            close(client->fd);
+            close(client->statusread_fd);
+            clients.erase(clients.begin() + i);
+            return;
+          }
+
+          close(client->statusread_fd);
+          write(client->fd, client->sendbuf.data(), client->sendbuf.size());
+          client->statusread_fd = -1;
+          client->sendbuf.clear();
+          client->sendbuf.shrink_to_fit();
+        } catch (const std::exception &e) {
+          SPDLOG_ERROR("An exception was occured while pasing minecraft backend data: {}, {}", *client->routed_server, e.what());
+          close(client->fd);
+          close(client->statusread_fd);
+          clients.erase(clients.begin() + i);
+          return;
+        }
+
+        if (ret == 0 and client->sendbuf.size() > 0) {
+          SPDLOG_ERROR("Backend minecraft server unexpected closed connection: {}, {}", *client->routed_server,
+                       std::system_category().message(errno));
+          close(client->fd);
+          close(client->statusread_fd);
+          clients.erase(clients.begin() + i);
+          return;
+        }
+
+        return;
+      }
+    }
+
+    int action_mask = 0;
+    if (event & EPOLLIN)
+      action_mask |= CURL_CSELECT_IN;
+    if (event & EPOLLOUT)
+      action_mask |= CURL_CSELECT_OUT;
+    if (event & (EPOLLERR | EPOLLHUP))
+      action_mask |= CURL_CSELECT_ERR;
+
+    int running_handles = 0;
+    curl_multi_socket_action(multi_handle, fd, action_mask, &running_handles);
+
+    check_completed_requests();
+  }
+}
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);
   epoll_fd = epoll_create1(O_CLOEXEC);
 
-  int tcpfd = init_tcp_socket(config.get_game_port());
+  tcpfd = init_tcp_socket(config.get_game_port());
   SPDLOG_INFO("Запущен сокет на порту: {}", config.get_game_port());
-  int webTcpFd = init_tcp_socket(config.get_web_port());
+  webTcpFd = init_tcp_socket(config.get_web_port());
   SPDLOG_INFO("Запущен веб сервер на порту: {}", config.get_web_port());
-  int minecraft_keepalive_timerfd = init_timerfd();
-  struct itimerspec minecraft_keepalive_ts = {};
+  minecraft_keepalive_timerfd = init_timerfd();
   init_curl_or_exit();
 
   struct epoll_event events[32];
   while (1) {
     int count = epoll_wait(epoll_fd, events, 32, -1);
+    for (int i = 0; i < count; i++)
+      onEpoll(events + i);
 
-    for (int i = 0; i < count; i++) {
-      int fd = events[i].data.fd;
-      uint32_t event = events[i].events;
-
-      if (fd == tcpfd) {
-        struct MinecraftClient client;
-        client.statusread_fd = -1;
-        client.state = ConnectionState::HandShake;
-
-        socklen_t addr_len = sizeof(client.addr);
-
-        client.fd = accept4(fd, (sockaddr *)&client.addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (client.fd < 0) {
-          SPDLOG_ERROR("Client error: {}", std::system_category().message(errno));
-          continue;
-        }
-
-        SPDLOG_INFO("client {} connected\n", client.fd);
-
-        clients.push_back(client);
-
-        ev.events = EPOLLIN;
-        ev.data.fd = client.fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &ev);
-
-        if (minecraft_keepalive_ts.it_interval.tv_sec == 0) {
-          minecraft_keepalive_ts.it_value.tv_sec = 20;
-          minecraft_keepalive_ts.it_interval.tv_sec = 20;
-          timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
-        }
-      } else if (fd == curl_timer_fd) {
-        read_timerfd(curl_timer_fd);
-        int running_handles = 0;
-        curl_multi_socket_action(multi_handle, CURL_SOCKET_TIMEOUT, 0, &running_handles);
-        check_completed_requests();
-      } else if (fd == minecraft_keepalive_timerfd) {
-        read_timerfd(minecraft_keepalive_timerfd);
-
-        for (size_t i = 0; i < clients.size(); i++) {
-          MinecraftClient *client = clients.data() + i;
-          if (client->state == ConnectionState::Configuration) {
-            ssize_t ret = write(client->fd, keepalivepacket, sizeof(keepalivepacket));
-            if (ret == -1 || ret != sizeof(keepalivepacket)) {
-              close(client->fd);
-              clients.erase(clients.begin() + i);
-              i--;
-            }
-          }
-        }
-      } else if (fd == webTcpFd) {
-        int webclientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (webclientfd < 0) {
-          perror("web client error");
-          continue;
-        }
-
-        struct WebClient client;
-        client.fd = webclientfd;
-        std::cout << "Web clietn " << webclientfd << " connected" << std::endl;
-
-        web_clients.push_back(client);
-
-        ev.events = EPOLLIN;
-        ev.data.fd = webclientfd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, webclientfd, &ev);
-      } else {
-        for (size_t i = 0; i < web_clients.size(); i++) {
-          struct WebClient *client = &web_clients[i];
-          if (fd == client->fd) {
-            onWebClientUpdate(client, i);
-            goto next;
-          }
-        }
-
-        for (size_t i = 0; i < clients.size(); i++) {
-          struct MinecraftClient *client = &clients[i];
-          if (fd == client->fd) {
-            onClientUpdate(client, i);
-            goto next;
-          }
-
-          if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Connection) {
-            int err = 0;
-            socklen_t len = sizeof(err);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-              fprintf(stderr, "Соединение НЕ установлено: %s\n", strerror(err));
-              close(client->statusread_fd);
-              close(client->fd);
-              clients.erase(clients.begin() + i);
-              goto next;
-            }
-
-            PacketWriter handshake = HandShake::encode(client->protocol_version, client->routed_server_config->host,
-                                                       client->routed_server_config->port, ConnectionReason::Status);
-            handshake.generate_iovec(iov);
-            iov[3].iov_base = (void *)status_request_packet;
-            iov[3].iov_len = sizeof(status_request_packet);
-
-            msghdr msg;
-            msg.msg_iov = iov;
-            msg.msg_iovlen = 3;
-
-            sendmsg(client->statusread_fd, &msg, MSG_MORE);
-            shutdown(client->statusread_fd, SHUT_WR);
-
-            ev.events = EPOLLIN;
-            ev.data.fd = client->statusread_fd;
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->statusread_fd, &ev) < 0) {
-              perror("epoll_ctl MOD");
-              close(client->statusread_fd);
-              close(client->fd);
-              clients.erase(clients.begin() + i);
-              goto next;
-            }
-
-            client->statusread_state = StatusReadState::Read;
-            goto next;
-          }
-
-          if (fd == client->statusread_fd && client->statusread_state == StatusReadState::Read) {
-            long ret;
-            while ((ret = read(client->statusread_fd, temp_buf, sizeof(temp_buf))) > 0) {
-              client->sendbuf.insert(client->sendbuf.end(), temp_buf, temp_buf + ret);
-            };
-
-            if (ret < 0 and errno != EAGAIN) {
-              perror("Client error(connection closed): ");
-              close(client->fd);
-              close(client->statusread_fd);
-              clients.erase(clients.begin() + i);
-              goto next;
-            }
-
-            if (ret == 0) {
-              std::cout << "Client closed connection" << std::endl;
-              close(client->fd);
-              close(client->statusread_fd);
-              clients.erase(clients.begin() + i);
-              goto next;
-            }
-
-            try {
-              std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
-              PacketReader reader(view);
-
-              std::optional<size_t> ret = reader.readUncompressed();
-              if (!ret.has_value())
-                goto next;
-
-              if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
-                close(client->fd);
-                close(client->statusread_fd);
-                clients.erase(clients.begin() + i);
-                goto next;
-              }
-
-              close(client->statusread_fd);
-              write(client->fd, client->sendbuf.data(), client->sendbuf.size());
-              client->statusread_fd = -1;
-              client->sendbuf.clear();
-              client->sendbuf.shrink_to_fit();
-            } catch (const std::exception &e) {
-              std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
-              close(client->fd);
-              close(client->statusread_fd);
-              clients.erase(clients.begin() + i);
-              goto next;
-            }
-
-            goto next;
-          }
-        }
-
-        int action_mask = 0;
-        if (event & EPOLLIN) {
-          action_mask |= CURL_CSELECT_IN; // Есть данные для чтения
-        }
-        if (event & EPOLLOUT) {
-          action_mask |= CURL_CSELECT_OUT; // Сокет готов к записи
-        }
-        if (event & (EPOLLERR | EPOLLHUP)) {
-          action_mask |= CURL_CSELECT_ERR; // Ошибка или разрыв соединения
-        }
-
-        // 2. Уведомляем curl, что на сокете fd произошло событие action_mask
-        int running_handles = 0;
-        curl_multi_socket_action(multi_handle, fd, action_mask, &running_handles);
-
-        // 3. Проверяем, не завершился ли запрос в результате этого I/O
-        check_completed_requests();
-      }
-
-    next:;
-    }
-
+    // Очищаем таймер если игроков больше нет
     if (clients.size() == 0 && minecraft_keepalive_ts.it_interval.tv_sec == 20) {
       minecraft_keepalive_ts.it_value.tv_sec = 0;
       minecraft_keepalive_ts.it_interval.tv_sec = 0;
