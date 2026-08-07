@@ -438,7 +438,7 @@ static inline void check_completed_requests() {
             }
 
             if (client == clients.end()) {
-              send(ctx->res_fd, &embedded::not_ok_html, embedded::not_ok_html.size(), MSG_MORE);
+              send(ctx->res_fd, embedded::not_ok_html.data(), embedded::not_ok_html.size(), MSG_MORE);
               close(ctx->res_fd);
               goto clean;
             }
@@ -448,12 +448,12 @@ static inline void check_completed_requests() {
           } catch (const std::exception &e) {
             std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
 
-            send(ctx->res_fd, &embedded::not_ok_html, embedded::not_ok_html.size(), MSG_MORE);
+            send(ctx->res_fd, embedded::not_ok_html.data(), embedded::not_ok_html.size(), MSG_MORE);
             close(ctx->res_fd);
             goto clean;
           }
 
-          send(ctx->res_fd, &embedded::ok_html, embedded::ok_html.size(), MSG_MORE);
+          send(ctx->res_fd, embedded::ok_html.data(), embedded::ok_html.size(), MSG_MORE);
           close(ctx->res_fd);
         clean:
           for (auto i = web_clients.begin(); i < web_clients.end(); i++) {
@@ -585,7 +585,7 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     }
 
     if (token.empty()) {
-      send(client->fd, &embedded::not_ok_html, embedded::not_ok_html.size(), MSG_MORE);
+      send(client->fd, embedded::not_ok_html.data(), embedded::not_ok_html.size(), MSG_MORE);
       close(client->fd);
       web_clients.erase(web_clients.begin() + client_index);
       return;
