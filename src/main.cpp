@@ -381,8 +381,12 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
     close(client->fd);
     if (client->statusread_fd)
       close(client->statusread_fd);
+
+    SPDLOG_INFO("1");
     clients.erase(clients.begin() + client_index);
   }
+
+  SPDLOG_INFO("2");
 }
 
 static inline void check_completed_requests() {
@@ -700,6 +704,7 @@ void onEpoll(epoll_event *ep_event) {
       struct WebClient *client = &web_clients[i];
       if (fd == client->fd) {
         onWebClientUpdate(client, i);
+        SPDLOG_INFO("3");
         return;
       }
     }
@@ -764,6 +769,8 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
+        SPDLOG_INFO("4");
+
         try {
           std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
           PacketReader reader(view);
@@ -772,12 +779,16 @@ void onEpoll(epoll_event *ep_event) {
           if (!ret.has_value())
             return;
 
+          SPDLOG_INFO("5");
+
           if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
             close(client->fd);
             close(client->statusread_fd);
             clients.erase(clients.begin() + i);
             return;
           }
+
+          SPDLOG_INFO("6");
 
           close(client->statusread_fd);
           write(client->fd, client->sendbuf.data(), client->sendbuf.size());
@@ -801,6 +812,7 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
+        SPDLOG_INFO("7");
         return;
       }
     }
@@ -836,6 +848,8 @@ int main() {
     int count = epoll_wait(epoll_fd, events, 32, -1);
     for (int i = 0; i < count; i++)
       onEpoll(events + i);
+
+    SPDLOG_INFO("8");
 
     // Очищаем таймер если игроков больше нет
     if (clients.size() == 0 && minecraft_keepalive_ts.it_interval.tv_sec == 20) {
