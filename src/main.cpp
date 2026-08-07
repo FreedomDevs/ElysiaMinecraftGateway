@@ -331,8 +331,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
       return;
     } else if (packet.getPacketId() == 8) {
       std::cout << "Client closed connection";
-      clients.erase(clients.begin() + client_index);
       close(client->fd);
+      clients.erase(clients.begin() + client_index);
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }

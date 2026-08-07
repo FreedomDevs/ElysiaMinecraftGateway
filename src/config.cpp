@@ -1,6 +1,7 @@
 #include "config.hpp"
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 void Config::load_config_or_exit() noexcept {
   SPDLOG_INFO("Инициализация конфиг файла");
