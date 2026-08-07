@@ -96,6 +96,8 @@ struct PlayerSession {
   std::chrono::system_clock::time_point expires_at; // Время истечения токена
 };
 
+char ipv6_str[INET6_ADDRSTRLEN];
+
 class TokenStorage {
 private:
   // username (в нижнем регистре) -> Данные сессии
@@ -127,11 +129,10 @@ public:
 
     const auto &session = it->second;
 
-    char str[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &current_ip, str, sizeof(str));
-    SPDLOG_INFO("CURR_IP: {}", str);
-    inet_ntop(AF_INET6, &session.ip, str, sizeof(str));
-    SPDLOG_INFO("SESS_IP: {}", str);
+    inet_ntop(AF_INET6, &current_ip, ipv6_str, sizeof(ipv6_str));
+    SPDLOG_INFO("CURR_IP: {}", ipv6_str);
+    inet_ntop(AF_INET6, &session.ip, ipv6_str, sizeof(ipv6_str));
+    SPDLOG_INFO("SESS_IP: {}", ipv6_str);
 
     // 1. Проверяем совпадение IP
     if (!IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
@@ -669,7 +670,8 @@ void onEpoll(epoll_event *ep_event) {
       return;
     }
 
-    SPDLOG_INFO("Minecraft client connected: {}", client.fd);
+    inet_ntop(AF_INET6, &client.addr, ipv6_str, sizeof(ipv6_str));
+    SPDLOG_INFO("Minecraft client connected: {}, ({})", client.fd, ipv6_str);
     clients.push_back(client);
 
     ev.events = EPOLLIN;
