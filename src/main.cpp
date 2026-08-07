@@ -662,13 +662,16 @@ void onEpoll(epoll_event *ep_event) {
     client.statusread_fd = -1;
     client.state = ConnectionState::HandShake;
 
-    socklen_t addr_len = sizeof(client.addr);
+    sockaddr_in6 addr{};
+    socklen_t addr_len = sizeof(sockaddr_in6);
 
-    client.fd = accept4(fd, (sockaddr *)&client.addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    client.fd = accept4(fd, (sockaddr *)&addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (client.fd < 0) {
       SPDLOG_ERROR("Can't accept minecraft connection: {}", std::system_category().message(errno));
       return;
     }
+
+    client.addr = addr.sin6_addr;
 
     inet_ntop(AF_INET6, &client.addr, ipv6_str, sizeof(ipv6_str));
     SPDLOG_INFO("Minecraft client connected: {}, ({})", client.fd, ipv6_str);
