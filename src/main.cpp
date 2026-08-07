@@ -217,6 +217,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     if (server_name) {
       client->routed_server = server_name.value();
     } else {
+      SPDLOG_WARN("Не найден домен для подключения пользователя: {}, {}", client->fd, handshake.getServerAddress());
       close(client->fd);
       clients.erase(clients.begin() + client_index);
       return;
@@ -226,6 +227,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     if (server_config) {
       client->routed_server_config = server_config.value();
     } else {
+      SPDLOG_ERROR("Не найден сервер для подключения пользователя: {}, {}", client->fd, *client->routed_server);
       close(client->fd);
       clients.erase(clients.begin() + client_index);
       return;
@@ -289,6 +291,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       sendmsg(client->fd, &msg, MSG_MORE);
       close(client->fd);
+      SPDLOG_INFO("Клиент {} отключен после успешного pong", client->fd);
       clients.erase(clients.begin() + client_index);
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
