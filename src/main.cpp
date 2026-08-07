@@ -201,7 +201,7 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   curl_multi_add_handle(multi_handle, easy);
 }
 
-static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_t client_index) {
+static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
   if (client->state == ConnectionState::HandShake) {
     if (packet.getPacketId() != 0)
       throw std::runtime_error("Incorrect packet id");
@@ -219,7 +219,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     } else {
       SPDLOG_WARN("Не найден домен для подключения пользователя: {}, {}", client->fd, handshake.getServerAddress());
       close(client->fd);
-      clients.erase(clients.begin() + client_index);
+      client->state = ConnectionState::Died;
       return;
     }
 
@@ -229,7 +229,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     } else {
       SPDLOG_ERROR("Не найден сервер для подключения пользователя: {}, {}", client->fd, *client->routed_server);
       close(client->fd);
-      clients.erase(clients.begin() + client_index);
+      client->state = ConnectionState::Died;
       return;
     }
 
@@ -291,8 +291,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
 
       sendmsg(client->fd, &msg, MSG_MORE);
       close(client->fd);
+      client->state = ConnectionState::Died;
       SPDLOG_INFO("Клиент {} отключен после успешного pong", client->fd);
-      clients.erase(clients.begin() + client_index);
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
@@ -333,9 +333,9 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet, size_
     if (packet.getPacketId() == 0 || packet.getPacketId() == 2 || packet.getPacketId() == 4) {
       return;
     } else if (packet.getPacketId() == 8) {
-      std::cout << "Client closed connection";
+      SPDLOG_INFO("Client closed connection");
       close(client->fd);
-      clients.erase(clients.begin() + client_index);
+      client->state = ConnectionState::Died;
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
@@ -374,7 +374,16 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       if (!ret.has_value())
         break;
 
-      onPacket(client, reader, client_index);
+      onPacket(client, reader);
+
+      if (client->state == ConnectionState::Died) {
+        close(client->fd);
+        if (client->statusread_fd)
+          close(client->statusread_fd);
+
+        clients.erase(clients.begin() + client_index);
+        return;
+      }
 
       memmove(client->buf.data(), client->buf.data() + *ret, client->buf.size() - *ret);
       client->buf.resize(client->buf.size() - *ret);
@@ -385,11 +394,8 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
     if (client->statusread_fd)
       close(client->statusread_fd);
 
-    SPDLOG_INFO("1");
     clients.erase(clients.begin() + client_index);
   }
-
-  SPDLOG_INFO("2");
 }
 
 static inline void check_completed_requests() {
