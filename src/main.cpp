@@ -1,3 +1,4 @@
+#include "HexUtil.hpp"
 #include "config.hpp"
 #include "embed.hpp"
 #include "network/PacketWriter.hpp"
@@ -125,6 +126,9 @@ public:
     }
 
     const auto &session = it->second;
+
+    SPDLOG_INFO("CURR_IP: {}", to_hex(std::span(current_ip.__in6_u.__u6_addr8, sizeof(in6_addr))));
+    SPDLOG_INFO("SESS_IP: {}", to_hex(std::span(session.ip.__in6_u.__u6_addr8, sizeof(in6_addr))));
 
     // 1. Проверяем совпадение IP
     if (!IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
@@ -713,7 +717,6 @@ void onEpoll(epoll_event *ep_event) {
       struct WebClient *client = &web_clients[i];
       if (fd == client->fd) {
         onWebClientUpdate(client, i);
-        SPDLOG_INFO("3");
         return;
       }
     }
