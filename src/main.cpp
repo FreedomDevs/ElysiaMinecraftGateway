@@ -377,7 +377,7 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       client->buf.resize(client->buf.size() - *ret);
     }
   } catch (const std::exception &e) {
-    std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
+    SPDLOG_ERROR("An exception was occured while pasing client data: {}", e.what());
     close(client->fd);
     if (client->statusread_fd)
       close(client->statusread_fd);
