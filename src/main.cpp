@@ -127,8 +127,11 @@ public:
 
     const auto &session = it->second;
 
-    SPDLOG_INFO("CURR_IP: {}", to_hex(std::span(current_ip.__in6_u.__u6_addr8, sizeof(in6_addr))));
-    SPDLOG_INFO("SESS_IP: {}", to_hex(std::span(session.ip.__in6_u.__u6_addr8, sizeof(in6_addr))));
+    char str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &current_ip, str, sizeof(str));
+    SPDLOG_INFO("CURR_IP: {}", str);
+    inet_ntop(AF_INET6, &session.ip, str, sizeof(str));
+    SPDLOG_INFO("SESS_IP: {}", str);
 
     // 1. Проверяем совпадение IP
     if (!IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
