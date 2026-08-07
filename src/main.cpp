@@ -485,7 +485,7 @@ static inline void check_completed_requests() {
             PacketWriter packetwriter1 = StoreCookie::encode("eauth:eauth-jwt", token);
             packetwriter1.generate_iovec(iov);
             PacketWriter packetwriter2 = Transfer::encode(client->routed_server_config->host, client->routed_server_config->port);
-            packetwriter2.generate_iovec(iov + 2);
+            packetwriter2.generate_iovec_to_2(iov + 2);
 
             struct msghdr msg{};
             msg.msg_iov = iov;
