@@ -285,7 +285,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       PacketWriter writer = StatusPong::encode(req.getPayload());
       writer.generate_iovec(iov);
 
-      msghdr msg;
+      msghdr msg = {};
       msg.msg_iov = iov;
       msg.msg_iovlen = 2;
 
@@ -662,7 +662,7 @@ void onEpoll(epoll_event *ep_event) {
       return;
     }
 
-    SPDLOG_INFO("Minecraft client connected: ", client.fd);
+    SPDLOG_INFO("Minecraft client connected: {}", client.fd);
     clients.push_back(client);
 
     ev.events = EPOLLIN;
@@ -743,10 +743,11 @@ void onEpoll(epoll_event *ep_event) {
         iov[2].iov_base = (void *)status_request_packet;
         iov[2].iov_len = sizeof(status_request_packet);
 
-        msghdr msg;
+        msghdr msg = {};
         msg.msg_iov = iov;
         msg.msg_iovlen = 3;
 
+        SPDLOG_INFO("Sended handshake to server");
         sendmsg(client->statusread_fd, &msg, MSG_MORE);
         shutdown(client->statusread_fd, SHUT_WR);
 
@@ -778,8 +779,6 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
-        SPDLOG_INFO("4");
-
         try {
           std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
           PacketReader reader(view);
@@ -788,16 +787,12 @@ void onEpoll(epoll_event *ep_event) {
           if (!ret.has_value())
             return;
 
-          SPDLOG_INFO("5");
-
           if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
             close(client->fd);
             close(client->statusread_fd);
             clients.erase(clients.begin() + i);
             return;
           }
-
-          SPDLOG_INFO("6");
 
           close(client->statusread_fd);
           write(client->fd, client->sendbuf.data(), client->sendbuf.size());
@@ -821,7 +816,6 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
-        SPDLOG_INFO("7");
         return;
       }
     }
@@ -857,8 +851,6 @@ int main() {
     int count = epoll_wait(epoll_fd, events, 32, -1);
     for (int i = 0; i < count; i++)
       onEpoll(events + i);
-
-    SPDLOG_INFO("8");
 
     // Очищаем таймер если игроков больше нет
     if (clients.size() == 0 && minecraft_keepalive_ts.it_interval.tv_sec == 20) {

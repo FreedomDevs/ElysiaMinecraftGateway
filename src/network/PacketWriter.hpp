@@ -2,6 +2,7 @@
 
 #include "types/String.hpp"
 #include "types/VarInt.hpp"
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
 #include <sys/uio.h>
@@ -35,7 +36,7 @@ public:
   void generate_iovec(iovec *__restrict io) { // Должен быть доступен io и io+1
     minecraft_header.clear();
     VarInt::writeVarInt(data.size(), minecraft_header);
-    io->iov_base = &minecraft_header;
+    io->iov_base = minecraft_header.data();
     io->iov_len = minecraft_header.size();
 
     (io + 1)->iov_base = data.data();
