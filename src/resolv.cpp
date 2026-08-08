@@ -13,7 +13,7 @@ int resolve_host(const char *host, int port, ResolvedAddress *out) {
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;     // AF_UNSPEC = поддерживаем и IPv4, и IPv6!
   hints.ai_socktype = SOCK_STREAM; // TCP
-  hints.ai_flags = AI_ADDRCONFIG;  // Запрашивать v6 только если в системе есть IPv6-интерфейсы
+  hints.ai_flags = AI_NUMERICHOST; // Запрашивать v6 только если в системе есть IPv6-интерфейсы
 
   int status = getaddrinfo(host, port_str, &hints, &res);
   if (status != 0) {

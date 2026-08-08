@@ -473,8 +473,9 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
   }
 
   if (ret == 0) {
-    SPDLOG_WARN("[conn#{} client#{}] Клиент закрыл соединение, байт осталось необработанно: {}", client->fd, client->connid,
-                client->buf.size());
+    if (client->buf.size() > 0)
+      SPDLOG_ERROR("[conn#{} client#{}] Клиент неожиданно закрыл соединение, байт осталось необработанно: {}", client->fd, client->connid,
+                   client->buf.size());
     closeConns(client, client_index);
     return;
   }
@@ -877,9 +878,9 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
-        if (ret == 0) {
-          SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft server unexpected closed connection: {}, {}", client->fd, client->connid,
-                       *client->routed_server, std::system_category().message(errno));
+        if (ret == 0 && client->sendbuf.size() > 0) {
+          SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft server unexpected closed connection: {}", client->fd, client->connid,
+                       *client->routed_server);
           closeConns(client, i);
           return;
         }
