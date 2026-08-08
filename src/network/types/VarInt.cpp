@@ -8,14 +8,14 @@ void writeVarInt(int value, std::vector<unsigned char> &buffer) {
   while (true) {
     unsigned char temp = static_cast<unsigned char>(uval & 0x7F);
 
-    value >>= 7;
+    uval >>= 7;
 
-    if (value != 0)
+    if (uval != 0)
       temp |= 0x80;
 
     buffer.push_back(temp);
 
-    if (value == 0)
+    if (uval == 0)
       break;
   }
 }

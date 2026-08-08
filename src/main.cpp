@@ -363,10 +363,10 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
       sendmsg(client->fd, &msg, MSG_MORE);
       close(client->fd);
-      client->fd = -1;
-
-      client->state = ConnectionState::Died;
       SPDLOG_INFO("[conn#{} client#{}] Вернули Pong клиенту, и закрыли соединение", client->fd, client->connid);
+
+      client->fd = -1;
+      client->state = ConnectionState::Died;
     } else {
       SPDLOG_INFO("[conn#{} client#{}] Получен status пакет с некорректным id: {}", client->fd, client->connid, packet.getPacketId());
       KILL_CONN;
@@ -499,10 +499,8 @@ static inline void check_completed_requests() {
         curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
 
         std::cout << "Запрос завершен! HTTP status: " << response_code << "\n";
-        std::cout << "Токен: " << ctx->token << "\n";
         std::cout << "Is refresh: " << ctx->is_check_refresh << "\n";
         std::cout << "fd: " << ctx->res_fd << "\n";
-        std::cout << "Ответ от сервера: " << ctx->response_body << "\n";
 
         if (ctx->is_check_refresh) {
           try {
@@ -528,7 +526,7 @@ static inline void check_completed_requests() {
             storage.save_token(username, client->addr, ctx->token, std::chrono::seconds(30 * 24 * 60 * 60));
             routePlayer(ctx->token, &*client);
           } catch (const std::exception &e) {
-            std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
+            SPDLOG_CRITICAL("Ошибка парсинга JSON: {}", e.what());
 
             send(ctx->res_fd, embedded::not_ok_html.data(), embedded::not_ok_html.size(), MSG_MORE);
             close(ctx->res_fd);
@@ -575,7 +573,7 @@ static inline void check_completed_requests() {
             sendmsg(client->fd, &msg, MSG_MORE);
             close(client->fd);
           } catch (const std::exception &e) {
-            std::cerr << "Ошибка парсинга JSON: " << e.what() << std::endl;
+            SPDLOG_ERROR("Ошибка парсинга JSON: {}", e.what());
 
             for (auto i = clients.begin(); i < clients.end(); i++) {
               if (i->fd == ctx->res_fd) {
