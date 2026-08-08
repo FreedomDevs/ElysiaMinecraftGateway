@@ -28,6 +28,7 @@
 #include <optional>
 #include <span>
 #include <spanstream>
+#include <spdlog/pattern_formatter.h>
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <stdexcept>
@@ -270,7 +271,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
     std::string clean_address = sanitize_for_log(handshake.getServerAddress());
     SPDLOG_INFO("[conn#{} client#{}] Получен Handshake, адрес: {}, версия протокола: {}, причина подключения: {}", client->fd,
-                client->connid, clean_address, handshake.getProtocolVersion(), (int)handshake.getProtocolVersion());
+                client->connid, clean_address, handshake.getProtocolVersion(), (int)handshake.getConnectionReason());
 
     if (handshake.getServerPort() != config.get_game_port()) {
       SPDLOG_WARN("[conn#{} client#{}] Некорректный порт для подключения, ожидался: {}, получен: {}", client->fd, client->connid,
@@ -904,7 +905,29 @@ void onEpoll(epoll_event *ep_event) {
   }
 }
 
+class custom_level_formatter : public spdlog::custom_flag_formatter {
+public:
+  void format(const spdlog::details::log_msg &msg, const std::tm &, spdlog::memory_buf_t &dest) override {
+    spdlog::string_view_t level_name;
+
+    if (msg.level == spdlog::level::warn) {
+      level_name = "warn";
+    } else {
+      level_name = spdlog::level::to_string_view(msg.level);
+    }
+
+    dest.append(level_name.data(), level_name.data() + level_name.size());
+  }
+
+  std::unique_ptr<custom_flag_formatter> clone() const override { return spdlog::details::make_unique<custom_level_formatter>(); }
+};
+
 int main() {
+  auto formatter = std::make_unique<spdlog::pattern_formatter>();
+  formatter->add_flag<custom_level_formatter>('u');
+  formatter->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%u%$] %v");
+  spdlog::set_formatter(std::move(formatter));
+
   std::signal(SIGPIPE, SIG_IGN);
   epoll_fd = epoll_create1(O_CLOEXEC);
 
