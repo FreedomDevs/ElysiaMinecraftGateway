@@ -31,6 +31,7 @@
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -134,12 +135,14 @@ static inline void setMinecraftKeepaliveTimerstate(bool state) {
       minecraft_keepalive_ts.it_value.tv_sec = 19;
       minecraft_keepalive_ts.it_interval.tv_sec = 19;
       timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
+      SPDLOG_INFO("Таймер на keepalive был активирован");
     }
   } else {
     if (minecraft_keepalive_ts.it_interval.tv_sec == 19) {
       minecraft_keepalive_ts.it_value.tv_sec = 0;
       minecraft_keepalive_ts.it_interval.tv_sec = 0;
       timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
+      SPDLOG_INFO("Таймер на keepalive был отключен");
     }
   }
 }
@@ -176,9 +179,7 @@ public:
     const auto &session = it->second;
 
     inet_ntop(AF_INET6, &current_ip, ipv6_str, sizeof(ipv6_str));
-    SPDLOG_INFO("CURR_IP: {}", ipv6_str);
     inet_ntop(AF_INET6, &session.ip, ipv6_str, sizeof(ipv6_str));
-    SPDLOG_INFO("SESS_IP: {}", ipv6_str);
 
     // 1. Проверяем совпадение IP
     if (!IN6_ARE_ADDR_EQUAL(&session.ip, &current_ip)) {
@@ -260,15 +261,16 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
   } while (0)
 
   if (client->state == ConnectionState::HandShake) {
-    if (packet.getPacketId() != 0)
-      throw std::runtime_error("Incorrect packet id");
-
+    if (packet.getPacketId() != 0) {
+      SPDLOG_INFO("[conn#{} client#{}] Клиент прислал HandShake с некорректным id: {}", client->fd, client->connid, packet.getPacketId());
+      KILL_CONN;
+    }
     HandShake handshake;
     handshake.decode(packet);
 
     std::string clean_address = sanitize_for_log(handshake.getServerAddress());
-    std::cout << "Получен Handshake, адрес: " << clean_address << ", версия протокола: " << handshake.getProtocolVersion()
-              << ", причина подключения: " << (int)handshake.getConnectionReason() << std::endl;
+    SPDLOG_INFO("[conn#{} client#{}] Получен Handshake, адрес: {}, версия протокола: {}, причина подключения: {}", client->fd,
+                client->connid, clean_address, handshake.getProtocolVersion(), (int)handshake.getProtocolVersion());
 
     if (handshake.getServerPort() != config.get_game_port()) {
       SPDLOG_WARN("[conn#{} client#{}] Некорректный порт для подключения, ожидался: {}, получен: {}", client->fd, client->connid,
@@ -277,13 +279,13 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
     }
 
     auto server_name = config.get_servername_by_domain(handshake.getServerAddress());
-    if (server_name) {
+    if (!server_name.has_value()) {
       SPDLOG_WARN("[conn#{} client#{}] Не найден домен для подключения пользователя: {}", client->fd, client->connid, clean_address);
       KILL_CONN;
     }
 
     auto server_config = config.get_server_by_name(*server_name.value());
-    if (!server_config) [[unlikely]] {
+    if (!server_config.has_value()) [[unlikely]] {
       SPDLOG_ERROR("[conn#{} client#{}] Не найден сервер для подключения пользователя: {}", client->fd, client->connid,
                    *client->routed_server);
       KILL_CONN;
@@ -365,7 +367,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       client->state = ConnectionState::Died;
       SPDLOG_INFO("[conn#{} client#{}] Вернули Pong клиенту, и закрыли соединение", client->fd, client->connid);
     } else {
-      throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
+      SPDLOG_INFO("[conn#{} client#{}] Получен status пакет с некорректным id: {}", client->fd, client->connid, packet.getPacketId());
+      KILL_CONN;
     }
   } else if (client->state == ConnectionState::Login) {
     if (packet.getPacketId() == 0) {
@@ -398,7 +401,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
         write(client->fd, embedded::dialog.data(), embedded::dialog.size());
       }
     } else {
-      throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
+      SPDLOG_INFO("[conn#{} client#{}] Получен login пакет с некорректным id: {}", client->fd, client->connid, packet.getPacketId());
+      KILL_CONN;
     }
   } else if (client->state == ConnectionState::Configuration) {
     if (packet.getPacketId() == 0 || packet.getPacketId() == 2 || packet.getPacketId() == 4) {
@@ -411,7 +415,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
   } else {
-    throw std::runtime_error("Incorrect state");
+    SPDLOG_INFO("[conn#{} client#{}] Получен configuration пакет с некорректным id: {}", client->fd, client->connid, packet.getPacketId());
+    KILL_CONN;
   }
 
 #undef KILL_CONN
@@ -739,12 +744,6 @@ void onEpoll(epoll_event *ep_event) {
     ev.events = EPOLLIN;
     ev.data.fd = client.fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &ev);
-
-    if (minecraft_keepalive_ts.it_interval.tv_sec == 0) {
-      minecraft_keepalive_ts.it_value.tv_sec = 20;
-      minecraft_keepalive_ts.it_interval.tv_sec = 20;
-      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
-    }
   } else if (fd == webTcpFd) {
     struct WebClient client;
     client.fd = accept4(fd, (sockaddr *)&sockaddr_addr, &sockaddr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
