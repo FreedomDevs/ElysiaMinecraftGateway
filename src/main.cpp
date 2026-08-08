@@ -1,4 +1,3 @@
-#include "HexUtil.hpp"
 #include "config.hpp"
 #include "embed.hpp"
 #include "network/PacketWriter.hpp"
@@ -55,8 +54,11 @@ enum class StatusReadState : unsigned char { Connection, Read };
 
 static char temp_buf[2048];
 
+static int last_connid = 0;
+
 struct MinecraftClient {
   int fd;
+  uint32_t connid;
   int protocol_version;
   int statusread_fd;
   std::vector<unsigned char> sendbuf;
@@ -72,6 +74,7 @@ struct MinecraftClient {
 
 struct WebClient {
   int fd;
+  uint32_t connid;
 };
 
 struct RequestContext {
@@ -96,7 +99,50 @@ struct PlayerSession {
   std::chrono::system_clock::time_point expires_at; // Время истечения токена
 };
 
+constexpr uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+constexpr uint8_t status_request_packet[] = {0x01, 0x00};
+static struct itimerspec minecraft_keepalive_ts = {};
+int minecraft_keepalive_timerfd;
+int tcpfd;
+int webTcpFd;
+
 char ipv6_str[INET6_ADDRSTRLEN];
+static sockaddr_in6 sockaddr_addr{};
+static socklen_t sockaddr_len = sizeof(sockaddr_in6);
+
+std::vector<MinecraftClient> clients;
+std::vector<WebClient> web_clients;
+
+std::string sanitize_for_log(std::string_view input) {
+  std::string clean;
+  clean.reserve(input.size());
+  for (char c : input) {
+    // Оставляем только обычные printable ASCII символы
+    if (std::isprint(static_cast<unsigned char>(c))) {
+      clean += c;
+    } else {
+      // Непечатаемые символы и ESC (0x1B) превращаем в hex-escaped вид
+      clean += fmt::format("\\x{:02x}", static_cast<unsigned char>(c));
+    }
+  }
+  return clean;
+}
+
+static inline void setMinecraftKeepaliveTimerstate(bool state) {
+  if (state) {
+    if (minecraft_keepalive_ts.it_interval.tv_sec == 0) {
+      minecraft_keepalive_ts.it_value.tv_sec = 19;
+      minecraft_keepalive_ts.it_interval.tv_sec = 19;
+      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
+    }
+  } else {
+    if (minecraft_keepalive_ts.it_interval.tv_sec == 19) {
+      minecraft_keepalive_ts.it_value.tv_sec = 0;
+      minecraft_keepalive_ts.it_interval.tv_sec = 0;
+      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
+    }
+  }
+}
 
 class TokenStorage {
 private:
@@ -153,9 +199,6 @@ public:
 };
 TokenStorage storage;
 
-std::vector<MinecraftClient> clients;
-std::vector<WebClient> web_clients;
-
 size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
   size_t total_size = size * nmemb;
   auto *ctx = static_cast<RequestContext *>(userdata);
@@ -210,6 +253,12 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
 }
 
 static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
+#define KILL_CONN                                                                                                                          \
+  do {                                                                                                                                     \
+    client->state = ConnectionState::Died;                                                                                                 \
+    return;                                                                                                                                \
+  } while (0)
+
   if (client->state == ConnectionState::HandShake) {
     if (packet.getPacketId() != 0)
       throw std::runtime_error("Incorrect packet id");
@@ -217,62 +266,71 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
     HandShake handshake;
     handshake.decode(packet);
 
+    std::string clean_address = sanitize_for_log(handshake.getServerAddress());
+    std::cout << "Получен Handshake, адрес: " << clean_address << ", версия протокола: " << handshake.getProtocolVersion()
+              << ", причина подключения: " << (int)handshake.getConnectionReason() << std::endl;
+
     if (handshake.getServerPort() != config.get_game_port()) {
-      throw std::runtime_error("Incorrect connection port: " + std::to_string(handshake.getServerPort()));
+      SPDLOG_WARN("[conn#{} client#{}] Некорректный порт для подключения, ожидался: {}, получен: {}", client->fd, client->connid,
+                  std::to_string(config.get_game_port()), std::to_string(handshake.getServerPort()));
+      KILL_CONN;
     }
 
     auto server_name = config.get_servername_by_domain(handshake.getServerAddress());
     if (server_name) {
-      client->routed_server = server_name.value();
-    } else {
-      SPDLOG_WARN("Не найден домен для подключения пользователя: {}, {}", client->fd, handshake.getServerAddress());
-      close(client->fd);
-      client->state = ConnectionState::Died;
-      return;
+      SPDLOG_WARN("[conn#{} client#{}] Не найден домен для подключения пользователя: {}", client->fd, client->connid, clean_address);
+      KILL_CONN;
     }
 
-    auto server_config = config.get_server_by_name(*client->routed_server);
-    if (server_config) {
-      client->routed_server_config = server_config.value();
-    } else {
-      SPDLOG_ERROR("Не найден сервер для подключения пользователя: {}, {}", client->fd, *client->routed_server);
-      close(client->fd);
-      client->state = ConnectionState::Died;
-      return;
+    auto server_config = config.get_server_by_name(*server_name.value());
+    if (!server_config) [[unlikely]] {
+      SPDLOG_ERROR("[conn#{} client#{}] Не найден сервер для подключения пользователя: {}", client->fd, client->connid,
+                   *client->routed_server);
+      KILL_CONN;
     }
 
-    std::cout << "Получен Handshake, адрес: " << handshake.getServerAddress() << ", версия протокола: " << handshake.getProtocolVersion()
-              << ", причина подключения: " << (int)handshake.getConnectionReason() << std::endl;
-
+    client->routed_server = server_name.value();
+    client->routed_server_config = server_config.value();
     client->protocol_version = handshake.getProtocolVersion();
+
     if (handshake.getConnectionReason() == ConnectionReason::Status)
       client->state = ConnectionState::Status;
-    else
+    else if (handshake.getConnectionReason() == ConnectionReason::Connnect)
       client->state = ConnectionState::Login;
+    else {
+      SPDLOG_ERROR("[conn#{} client#{}] Получен некорректный ConnectionReason", client->fd, client->connid);
+      KILL_CONN;
+    }
   } else if (client->state == ConnectionState::Status) {
     if (packet.getPacketId() == 0) {
       StatusRequest req;
       req.decode(packet);
 
-      std::cout << "Получен Status" << std::endl;
+      SPDLOG_INFO("[conn#{} client#{}] Получен запрос Status", client->fd, client->connid);
 
       ResolvedAddress res_addr;
       if (resolve_host(client->routed_server_config->host.c_str(), client->routed_server_config->port, &res_addr) < 0) {
-        throw std::runtime_error("Не удалось отрезолвить домен типо");
+        SPDLOG_ERROR("[conn#{} client#{}] Не удалось отрезолвить домен в адресе сервера", client->fd, client->connid);
+        KILL_CONN;
       }
 
       int sock_fd = socket(res_addr.family, SOCK_STREAM | SOCK_NONBLOCK, 0);
       if (sock_fd < 0) {
-        perror("status socket");
-        throw std::runtime_error("Status socket failed");
+        SPDLOG_ERROR("[conn#{} client#{}] Не удалось создать сетевой сокет", client->fd, client->connid,
+                     std::system_category().message(errno));
+        KILL_CONN;
       }
+
+      SPDLOG_DEBUG("[conn#{} client#{}] Создан statusfd: {}", client->fd, client->connid, sock_fd);
+
       client->statusread_fd = sock_fd;
       client->statusread_state = StatusReadState::Connection;
 
       int res = connect(sock_fd, (struct sockaddr *)&res_addr.addr, res_addr.addr_len);
       if (res < 0 && errno != EINPROGRESS) {
-        perror("connect");
-        throw std::runtime_error("Ошибка всего говна");
+        SPDLOG_DEBUG("[conn#{} client#{}] Не удалось создать соединение с сервером: {}", client->fd, client->connid,
+                     std::system_category().message(errno));
+        KILL_CONN;
       }
 
       struct epoll_event ev;
@@ -283,12 +341,15 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       ev.data.fd = sock_fd;
 
       if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_fd, &ev) < 0) {
-        perror("epoll_ctl ADD");
-        throw std::runtime_error("Не удалось чела добавить в epoll");
+        SPDLOG_DEBUG("[conn#{} client#{}] Не удалось добавить backend сервер в epoll: {}", client->fd, client->connid,
+                     std::system_category().message(errno));
+        KILL_CONN;
       }
     } else if (packet.getPacketId() == 1) {
       StatusPing req;
       req.decode(packet);
+
+      SPDLOG_DEBUG("[conn#{} client#{}] Получен Ping запрос от клиента", client - fd, client->connid);
 
       PacketWriter writer = StatusPong::encode(req.getPayload());
       writer.generate_iovec(iov);
@@ -299,8 +360,10 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
       sendmsg(client->fd, &msg, MSG_MORE);
       close(client->fd);
+      client->fd = -1;
+
       client->state = ConnectionState::Died;
-      SPDLOG_INFO("Клиент {} отключен после успешного pong", client->fd);
+      SPDLOG_INFO("[conn#{} client#{}] Вернули Pong клиенту, и закрыли соединение", client->fd, client->connid);
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
@@ -350,28 +413,34 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
   } else {
     throw std::runtime_error("Incorrect state");
   }
+
+#undef KILL_CONN
+}
+
+static inline void closeConns(MinecraftClient *client, size_t client_index) {
+  if (client->fd >= 0) {
+    close(client->fd);
+    SPDLOG_INFO("[conn#{} client#{}] Соединение закрыто", client->fd, client->connid);
+  }
+  if (client->statusread_fd >= 0) {
+    close(client->statusread_fd);
+    SPDLOG_INFO("[conn#{} client#{}] Соединение с backend сервером закрыто, fd = {}", client->fd, client->connid, client->statusread_fd);
+  }
+
+  setMinecraftKeepaliveTimerstate(false);
+  clients.erase(clients.begin() + client_index);
 }
 
 static inline void onClientUpdate(MinecraftClient *client, size_t client_index) {
-  long ret;
-  while ((ret = read(client->fd, temp_buf, sizeof(temp_buf))) > 0) {
-    client->buf.insert(client->buf.end(), temp_buf, temp_buf + ret);
-  };
-
-  if (ret < 0 and errno != EAGAIN) {
-    perror("Client error(connection closed): ");
-    close(client->fd);
-    clients.erase(clients.begin() + client_index);
+  long ret = read(client->fd, temp_buf, sizeof(temp_buf));
+  if (ret < 0 && errno != EAGAIN) [[unlikely]] {
+    SPDLOG_ERROR("[conn#{} client#{}] Не удалось вычитать данные клиента: {}", client->fd, client->connid,
+                 std::system_category().message(errno));
+    closeConns(client, client_index);
     return;
   }
 
-  if (ret == 0) {
-    std::cout << "Client closed connection" << std::endl;
-    close(client->fd);
-    clients.erase(clients.begin() + client_index);
-    return;
-  }
-
+  client->buf.insert(client->buf.end(), temp_buf, temp_buf + ret);
   try {
     while (true) {
       std::span<unsigned char> view(client->buf.data(), client->buf.size());
@@ -385,11 +454,7 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       onPacket(client, reader);
 
       if (client->state == ConnectionState::Died) {
-        close(client->fd);
-        if (client->statusread_fd)
-          close(client->statusread_fd);
-
-        clients.erase(clients.begin() + client_index);
+        closeConns(client, client_index);
         return;
       }
 
@@ -397,12 +462,15 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
       client->buf.resize(client->buf.size() - *ret);
     }
   } catch (const std::exception &e) {
-    SPDLOG_ERROR("An exception was occured while pasing client data: {}", e.what());
-    close(client->fd);
-    if (client->statusread_fd)
-      close(client->statusread_fd);
+    SPDLOG_ERROR("[conn#{} client#{}] Неожиданная ошибка произошла при парсинга данных клиента: {}", client->fd, client->connid, e.what());
+    closeConns(client, client_index);
+  }
 
-    clients.erase(clients.begin() + client_index);
+  if (ret == 0) {
+    SPDLOG_WARN("[conn#{} client#{}] Клиент закрыл соединение, байт осталось необработанно: {}", client->fd, client->connid,
+                client->buf.size());
+    closeConns(client, client_index);
+    return;
   }
 }
 
@@ -512,9 +580,9 @@ static inline void check_completed_requests() {
             goto clean1;
           }
         clean1:
-          for (auto i = clients.begin(); i < clients.end(); i++) {
-            if (i->fd == ctx->res_fd) {
-              clients.erase(i);
+          for (size_t i = 0; i < clients.size(); i++) {
+            if (clients[i].fd == ctx->res_fd) {
+              closeConns(&clients[i], i);
               break;
             }
           }
@@ -640,18 +708,11 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     // 4. Отдаём в multi handle
     curl_multi_add_handle(multi_handle, easy);
   } catch (const std::exception &e) {
-    std::cerr << "An exception was occured while pasing client data: " << e.what() << std::endl;
+    std::cerr << "An exception occured while pasing client data: " << e.what() << std::endl;
     close(client->fd);
     web_clients.erase(web_clients.begin() + client_index);
   }
 }
-
-constexpr uint8_t keepalivepacket[] = {0x09, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-constexpr uint8_t status_request_packet[] = {0x01, 0x00};
-static struct itimerspec minecraft_keepalive_ts = {};
-int minecraft_keepalive_timerfd;
-int tcpfd;
-int webTcpFd;
 
 void onEpoll(epoll_event *ep_event) {
   int fd = ep_event->data.fd;
@@ -659,22 +720,20 @@ void onEpoll(epoll_event *ep_event) {
 
   if (fd == tcpfd) {
     struct MinecraftClient client;
-    client.statusread_fd = -1;
-    client.state = ConnectionState::HandShake;
 
-    sockaddr_in6 addr{};
-    socklen_t addr_len = sizeof(sockaddr_in6);
-
-    client.fd = accept4(fd, (sockaddr *)&addr, &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    client.fd = accept4(fd, (sockaddr *)&sockaddr_addr, &sockaddr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (client.fd < 0) {
       SPDLOG_ERROR("Can't accept minecraft connection: {}", std::system_category().message(errno));
       return;
     }
 
-    client.addr = addr.sin6_addr;
+    client.state = ConnectionState::HandShake;
+    client.statusread_fd = -1;
+    client.connid = last_connid++;
+    client.addr = sockaddr_addr.sin6_addr;
 
     inet_ntop(AF_INET6, &client.addr, ipv6_str, sizeof(ipv6_str));
-    SPDLOG_INFO("Minecraft client connected: {}, ({})", client.fd, ipv6_str);
+    SPDLOG_INFO("[conn#{}, client#{}] Minecraft client connected: {}", client.fd, client.connid, ipv6_str);
     clients.push_back(client);
 
     ev.events = EPOLLIN;
@@ -688,13 +747,15 @@ void onEpoll(epoll_event *ep_event) {
     }
   } else if (fd == webTcpFd) {
     struct WebClient client;
-    client.fd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    client.fd = accept4(fd, (sockaddr *)&sockaddr_addr, &sockaddr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (client.fd < 0) {
       SPDLOG_ERROR("Can't accept web connection: ", std::system_category().message(errno));
       return;
     }
 
-    SPDLOG_INFO("Web client connected: {}", client.fd);
+    client.connid = last_connid++;
+
+    SPDLOG_INFO("[conn#{}, client#{}] Web client connected", client.fd, client.connid);
     web_clients.push_back(client);
 
     ev.events = EPOLLIN;
@@ -740,11 +801,9 @@ void onEpoll(epoll_event *ep_event) {
         int err = 0;
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-          SPDLOG_ERROR("Can't establish connection with backend minecraft server: {}, {}", *client->routed_server,
-                       std::system_category().message(errno));
-          close(client->statusread_fd);
-          close(client->fd);
-          clients.erase(clients.begin() + i);
+          SPDLOG_ERROR("[conn#{} client#{}] Не удалось установить соединение с backend сервером: fd = {}, server = {}, errno = {}",
+                       client->fd, client->connid, client->statusread_fd, *client->routed_server, std::system_category().message(errno));
+          closeConns(client, i);
           return;
         }
 
@@ -758,16 +817,16 @@ void onEpoll(epoll_event *ep_event) {
         msg.msg_iov = iov;
         msg.msg_iovlen = 3;
 
-        SPDLOG_INFO("Sended handshake to server");
+        SPDLOG_INFO("conn#{} client#{}] Отправляем handshake на сервер: fd = {}", client->fd, client->connid, client->statusread_fd);
         sendmsg(client->statusread_fd, &msg, MSG_MORE);
         shutdown(client->statusread_fd, SHUT_WR);
 
         ev.events = EPOLLIN;
         ev.data.fd = client->statusread_fd;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->statusread_fd, &ev) < 0) {
-          close(client->statusread_fd);
-          close(client->fd);
-          clients.erase(clients.begin() + i);
+          SPDLOG_ERROR("[conn#{} client#{}] Не удалось переключить epoll в режим чтения на backend сервере: fd = {}, errno = {}",
+                       client->fd, client->connid, client->statusread_fd, std::system_category().message(errno));
+          closeConns(client, i);
           return;
         }
 
@@ -782,11 +841,9 @@ void onEpoll(epoll_event *ep_event) {
         };
 
         if (ret < 0 and errno != EAGAIN) {
-          SPDLOG_ERROR("Can't read data from backend minecraft server: {}, {}", *client->routed_server,
-                       std::system_category().message(errno));
-          close(client->fd);
-          close(client->statusread_fd);
-          clients.erase(clients.begin() + i);
+          SPDLOG_ERROR("[conn#{} client#{}] Не удалось прочитать данные от backend сервера: fd = {}, server = {}, errno {}", client->fd,
+                       client->connid, client->statusread_fd, *client->routed_server, std::system_category().message(errno));
+          closeConns(client, i);
           return;
         }
 
@@ -799,31 +856,33 @@ void onEpoll(epoll_event *ep_event) {
             return;
 
           if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
-            close(client->fd);
-            close(client->statusread_fd);
-            clients.erase(clients.begin() + i);
+            SPDLOG_ERROR("[conn#{} client#{}] Backend сервер вернул пакет с некорректным id: {}, или не удалось дочитать пакет до конца: "
+                         "{}, fd = {}",
+                         client->fd, client->connid, reader.getPacketId(), client->sendbuf.size(), client->statusread_fd);
+            closeConns(client, i);
             return;
           }
 
           close(client->statusread_fd);
+          SPDLOG_INFO("[conn#{} client#{}] Закрыто соединение с backend после успешного чтения статуса, fd = {}", client->fd,
+                      client->connid, client->statusread_fd);
+
           write(client->fd, client->sendbuf.data(), client->sendbuf.size());
+
           client->statusread_fd = -1;
           client->sendbuf.clear();
           client->sendbuf.shrink_to_fit();
         } catch (const std::exception &e) {
-          SPDLOG_ERROR("An exception was occured while pasing minecraft backend data: {}, {}", *client->routed_server, e.what());
-          close(client->fd);
-          close(client->statusread_fd);
-          clients.erase(clients.begin() + i);
+          SPDLOG_ERROR("[conn#{} client#{}] An exception occured while pasing minecraft backend data: {}, {}", client->fd, client->connid,
+                       *client->routed_server, e.what());
+          closeConns(client, i);
           return;
         }
 
-        if (ret == 0 and client->sendbuf.size() > 0) {
-          SPDLOG_ERROR("Backend minecraft server unexpected closed connection: {}, {}", *client->routed_server,
-                       std::system_category().message(errno));
-          close(client->fd);
-          close(client->statusread_fd);
-          clients.erase(clients.begin() + i);
+        if (ret == 0) {
+          SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft server unexpected closed connection: {}, {}", client->fd, client->connid,
+                       *client->routed_server, std::system_category().message(errno));
+          closeConns(client, i);
           return;
         }
 
@@ -862,13 +921,6 @@ int main() {
     int count = epoll_wait(epoll_fd, events, 32, -1);
     for (int i = 0; i < count; i++)
       onEpoll(events + i);
-
-    // Очищаем таймер если игроков больше нет
-    if (clients.size() == 0 && minecraft_keepalive_ts.it_interval.tv_sec == 20) {
-      minecraft_keepalive_ts.it_value.tv_sec = 0;
-      minecraft_keepalive_ts.it_interval.tv_sec = 0;
-      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
-    }
   }
 
   return 0;

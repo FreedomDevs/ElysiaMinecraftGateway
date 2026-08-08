@@ -1,11 +1,12 @@
 #include "VarInt.hpp"
+#include <cstdint>
 #include <stdexcept>
 
 namespace VarInt {
 void writeVarInt(int value, std::vector<unsigned char> &buffer) {
-
+  uint32_t uval = static_cast<uint32_t>(value);
   while (true) {
-    unsigned char temp = static_cast<unsigned char>(value & 0x7F);
+    unsigned char temp = static_cast<unsigned char>(uval & 0x7F);
 
     value >>= 7;
 
