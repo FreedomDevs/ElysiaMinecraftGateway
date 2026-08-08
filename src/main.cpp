@@ -852,7 +852,7 @@ void onEpoll(epoll_event *ep_event) {
 
           std::optional<size_t> ret = reader.readUncompressed();
           if (!ret.has_value())
-            return;
+            goto skip;
 
           if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
             SPDLOG_ERROR("[conn#{} client#{}] Backend сервер вернул пакет с некорректным id: {}, или не удалось дочитать пакет до конца: "
@@ -878,6 +878,7 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
+      skip:
         if (ret == 0 && client->sendbuf.size() > 0) {
           SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft server unexpected closed connection: {}", client->fd, client->connid,
                        *client->routed_server);
