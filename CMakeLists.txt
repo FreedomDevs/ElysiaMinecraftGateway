@@ -29,7 +29,7 @@ find_package(CURL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog REQUIRED)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-g -Og -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wall -Wextra -pedantic")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -Og -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wall -Wextra -pedantic -fsanitize=address -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -flto")
 set(CMAKE_CXX_FLAGS_NATIVE "-O2 -DNDEBUG -flto -march=native")
 

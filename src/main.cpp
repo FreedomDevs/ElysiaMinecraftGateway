@@ -352,7 +352,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       StatusPing req;
       req.decode(packet);
 
-      SPDLOG_DEBUG("[conn#{} client#{}] Получен Ping запрос от клиента", client - fd, client->connid);
+      SPDLOG_DEBUG("[conn#{} client#{}] Получен Ping запрос от клиента", client->fd, client->connid);
 
       PacketWriter writer = StatusPong::encode(req.getPayload());
       writer.generate_iovec(iov);
@@ -464,6 +464,7 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
         return;
       }
 
+      SPDLOG_DEBUG("[conn#{} client#{}] В буфере было: {}, было прочитанно: {}", client->fd, client->connid, client->buf.size(), *ret);
       memmove(client->buf.data(), client->buf.data() + *ret, client->buf.size() - *ret);
       client->buf.resize(client->buf.size() - *ret);
     }
@@ -816,7 +817,7 @@ void onEpoll(epoll_event *ep_event) {
         msg.msg_iov = iov;
         msg.msg_iovlen = 3;
 
-        SPDLOG_INFO("conn#{} client#{}] Отправляем handshake на сервер: fd = {}", client->fd, client->connid, client->statusread_fd);
+        SPDLOG_INFO("[conn#{} client#{}] Отправляем handshake на сервер: fd = {}", client->fd, client->connid, client->statusread_fd);
         sendmsg(client->statusread_fd, &msg, MSG_MORE);
         shutdown(client->statusread_fd, SHUT_WR);
 
@@ -890,6 +891,8 @@ void onEpoll(epoll_event *ep_event) {
       }
     }
 
+    SPDLOG_DEBUG("Не нашлось сокета для fd = {}", fd);
+
     int action_mask = 0;
     if (event & EPOLLIN)
       action_mask |= CURL_CSELECT_IN;
@@ -927,6 +930,7 @@ int main() {
   formatter->add_flag<custom_level_formatter>('u');
   formatter->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%u%$] %v");
   spdlog::set_formatter(std::move(formatter));
+  spdlog::set_level(spdlog::level::debug);
 
   std::signal(SIGPIPE, SIG_IGN);
   epoll_fd = epoll_create1(O_CLOEXEC);
