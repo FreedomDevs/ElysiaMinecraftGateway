@@ -1,0 +1,26 @@
+[Unit]
+Description=My C++ App Supervisor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/your/cpp_app
+WorkingDirectory=/path/to/working_dir
+
+# Перезапуск при любых падениях (сигналы, ошибки)
+Restart=on-failure
+RestartSec=3s
+
+ExecStopPost=/bin/sh -c '\
+  if [ "$EXIT_STATUS" != "0" ]; then \
+    journalctl --user-unit=elysia_minecraft_gateway.service -n 50 --no-pager | curl \
+      -H "Authorization: Bearer tk_YOUR_TOKEN_HERE" \
+      -H "Title: App Crashed (Exit: $EXIT_STATUS)" \
+      -H "Priority: high" \
+      -H "Tags: warning,skull" \
+      --data-binary @- \
+      https://ntfy.sh/your_topic; \
+  fi'
+
+[Install]
+WantedBy=default.target
