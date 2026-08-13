@@ -43,4 +43,5 @@ public:
   std::string getServerAddress() { return server_address; }
   unsigned short getServerPort() { return server_port; }
   ConnectionReason getConnectionReason() { return connection_reason; }
+  bool isSnapshot() { return (protocol_version & 0x40000000) != 0; }
 };

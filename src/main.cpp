@@ -6,6 +6,7 @@
 #include "network/packets/configuration/StoreCookie.hpp"
 #include "network/packets/configuration/Transfer.hpp"
 #include "network/packets/login/LoginAcknowledged.hpp"
+#include "network/packets/login/LoginDisconnect.hpp"
 #include "network/packets/login/LoginStart.hpp"
 #include "network/packets/login/LoginSuccess.hpp"
 #include "network/packets/status/StatusPing.hpp"
@@ -45,7 +46,9 @@
 #include "epoll_fd.hpp"
 #include "network/curl_init.hpp"
 #include "network/sockets.hpp"
+#include "readbuf.hpp"
 #include "resolv.hpp"
+#include "socket_drainer.hpp"
 
 Config config = Config("config.json");
 static iovec iov[4]; // Нужен 4
@@ -53,8 +56,6 @@ static iovec iov[4]; // Нужен 4
 enum class ConnectionState : unsigned char { HandShake, Status, Login, Configuration, Play, Died };
 
 enum class StatusReadState : unsigned char { Connection, Read };
-
-static char temp_buf[2048];
 
 static int last_connid = 0;
 
@@ -298,9 +299,27 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
     if (handshake.getConnectionReason() == ConnectionReason::Status)
       client->state = ConnectionState::Status;
-    else if (handshake.getConnectionReason() == ConnectionReason::Connnect)
+    else if (handshake.getConnectionReason() == ConnectionReason::Connnect) {
       client->state = ConnectionState::Login;
-    else {
+
+      if (handshake.isSnapshot()) {
+        PacketWriter writer =
+            LoginDisconnect::encode(R"({"text":"Подключение со снапшотов не поддерживается","color":"red","bold": true})");
+        writer.generate_iovec(iov);
+
+        msghdr msg = {};
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 2;
+
+        sendmsg(client->fd, &msg, MSG_MORE);
+        draining_sockets::add(client->fd);
+        SPDLOG_INFO("[conn#{} client#{}] Подключение со снапшотов не поддерживается, запущен отложенный shutdown", client->fd,
+                    client->connid);
+
+        client->fd = -1;
+        client->state = ConnectionState::Died;
+      }
+    } else {
       SPDLOG_ERROR("[conn#{} client#{}] Получен некорректный ConnectionReason", client->fd, client->connid);
       KILL_CONN;
     }
@@ -377,7 +396,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       req.decode(packet);
 
       LoginSuccess resp;
-      resp.encode(req.getUUID1(), req.getUUID2(), req.getUsername());
+      resp.encode(req.getUUID1(), req.getUUID2(), req.getUsername(), client->protocol_version);
 
       PacketWriter writer = resp.getPacketWriter();
       writer.generate_iovec(iov);
@@ -410,8 +429,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       return;
     } else if (packet.getPacketId() == 8) {
       SPDLOG_INFO("Client closed connection");
-      close(client->fd);
-      client->state = ConnectionState::Died;
+      KILL_CONN;
     } else {
       throw std::runtime_error("Incorrect packet id " + std::to_string(packet.getPacketId()));
     }
@@ -464,7 +482,7 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
         return;
       }
 
-      SPDLOG_DEBUG("[conn#{} client#{}] В буфере было: {}, было прочитанно: {}", client->fd, client->connid, client->buf.size(), *ret);
+      SPDLOG_DEBUG("[conn#{} client#{}] В буфере было: {}, было прочитано: {}", client->fd, client->connid, client->buf.size(), *ret);
       memmove(client->buf.data(), client->buf.data() + *ret, client->buf.size() - *ret);
       client->buf.resize(client->buf.size() - *ret);
     }
@@ -500,10 +518,6 @@ static inline void check_completed_requests() {
         long response_code = 0;
         curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
 
-        std::cout << "Запрос завершен! HTTP status: " << response_code << "\n";
-        std::cout << "Is refresh: " << ctx->is_check_refresh << "\n";
-        std::cout << "fd: " << ctx->res_fd << "\n";
-
         if (ctx->is_check_refresh) {
           try {
             // Парсим строку в объект json
@@ -525,6 +539,8 @@ static inline void check_completed_requests() {
               goto clean;
             }
 
+            SPDLOG_INFO("[conn#{} client#{}] Получен refresh токен через curl по fd: {}, HTTP статус: {}", client->fd, client->connid,
+                        ctx->res_fd, response_code);
             storage.save_token(username, client->addr, ctx->token, std::chrono::seconds(30 * 24 * 60 * 60));
             routePlayer(ctx->token, &*client);
           } catch (const std::exception &e) {
@@ -569,11 +585,17 @@ static inline void check_completed_requests() {
             PacketWriter packetwriter2 = Transfer::encode(client->routed_server_config->host, client->routed_server_config->port);
             packetwriter2.generate_iovec_to_2(iov + 2);
 
+            SPDLOG_INFO(
+                "[conn#{} client#{}] Получен access токен через curl по fd: {}, HTTP статус: {}, клиент редиректнут, соединение закрыто",
+                client->fd, client->connid, ctx->res_fd, response_code);
+
             struct msghdr msg{};
             msg.msg_iov = iov;
             msg.msg_iovlen = 4; // 4 io мы использовали
             sendmsg(client->fd, &msg, MSG_MORE);
             close(client->fd);
+            client->fd = -1;
+
           } catch (const std::exception &e) {
             SPDLOG_ERROR("Ошибка парсинга JSON: {}", e.what());
 
@@ -594,7 +616,7 @@ static inline void check_completed_requests() {
           }
         }
       } else {
-        std::cerr << "Ошибка cURL: " << curl_easy_strerror(result) << "\n";
+        SPDLOG_ERROR("Ошибка cURL: {}", curl_easy_strerror(result));
       }
 
       // 2. ОБЯЗАТЕЛЬНО: удаляем handle из multi и чистим память
@@ -781,6 +803,8 @@ void onEpoll(epoll_event *ep_event) {
     }
 
     std::erase_if(clients, [](const MinecraftClient &c) { return c.state == ConnectionState::Died; });
+  } else if (draining_sockets::has(fd)) {
+    draining_sockets::drain(fd, event);
   } else {
     for (size_t i = 0; i < web_clients.size(); i++) {
       struct WebClient *client = &web_clients[i];
@@ -851,11 +875,11 @@ void onEpoll(epoll_event *ep_event) {
           std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
           PacketReader reader(view);
 
-          std::optional<size_t> ret = reader.readUncompressed();
-          if (!ret.has_value())
+          std::optional<size_t> res = reader.readUncompressed();
+          if (!res.has_value())
             goto skip;
 
-          if (reader.getPacketId() != 0 || *ret != client->sendbuf.size()) {
+          if (reader.getPacketId() != 0 || *res != client->sendbuf.size()) {
             SPDLOG_ERROR("[conn#{} client#{}] Backend сервер вернул пакет с некорректным id: {}, или не удалось дочитать пакет до конца: "
                          "{}, fd = {}",
                          client->fd, client->connid, reader.getPacketId(), client->sendbuf.size(), client->statusread_fd);
@@ -866,14 +890,14 @@ void onEpoll(epoll_event *ep_event) {
           close(client->statusread_fd);
           SPDLOG_INFO("[conn#{} client#{}] Закрыто соединение с backend после успешного чтения статуса, fd = {}", client->fd,
                       client->connid, client->statusread_fd);
+          client->statusread_fd = -1;
 
           write(client->fd, client->sendbuf.data(), client->sendbuf.size());
 
-          client->statusread_fd = -1;
           client->sendbuf.clear();
           client->sendbuf.shrink_to_fit();
         } catch (const std::exception &e) {
-          SPDLOG_ERROR("[conn#{} client#{}] An exception occured while pasing minecraft backend data: {}, {}", client->fd, client->connid,
+          SPDLOG_ERROR("[conn#{} client#{}] Произошла ошибка при парсинга данных от backend сервера: {}, {}", client->fd, client->connid,
                        *client->routed_server, e.what());
           closeConns(client, i);
           return;
@@ -881,7 +905,7 @@ void onEpoll(epoll_event *ep_event) {
 
       skip:
         if (ret == 0 && client->sendbuf.size() > 0) {
-          SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft server unexpected closed connection: {}", client->fd, client->connid,
+          SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft сервер неожиданно закрыл соединение: {}", client->fd, client->connid,
                        *client->routed_server);
           closeConns(client, i);
           return;
@@ -925,14 +949,23 @@ public:
   std::unique_ptr<custom_flag_formatter> clone() const override { return spdlog::details::make_unique<custom_level_formatter>(); }
 };
 
+void signal_handler(int signal) {
+  if (signal == SIGTERM || signal == SIGINT) {
+    _exit(0);
+  }
+}
+
 int main() {
   auto formatter = std::make_unique<spdlog::pattern_formatter>();
   formatter->add_flag<custom_level_formatter>('u');
-  formatter->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%u%$] %v");
+  formatter->set_pattern("[%^%u%$] %v");
   spdlog::set_formatter(std::move(formatter));
   spdlog::set_level(spdlog::level::debug);
 
   std::signal(SIGPIPE, SIG_IGN);
+  std::signal(SIGTERM, signal_handler);
+  std::signal(SIGINT, signal_handler);
+
   epoll_fd = epoll_create1(O_CLOEXEC);
 
   tcpfd = init_tcp_socket(config.get_game_port());
@@ -947,6 +980,8 @@ int main() {
     int count = epoll_wait(epoll_fd, events, 32, -1);
     for (int i = 0; i < count; i++)
       onEpoll(events + i);
+
+    draining_sockets::clean();
   }
 
   return 0;

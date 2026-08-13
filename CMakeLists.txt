@@ -29,9 +29,19 @@ find_package(CURL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog REQUIRED)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-g -Og -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wall -Wextra -pedantic -fsanitize=address -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -Og -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wall -Wextra -pedantic -fsanitize=address")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -flto")
 set(CMAKE_CXX_FLAGS_NATIVE "-O2 -DNDEBUG -flto -march=native")
+
+option(ENABLE_NATIVE "Optimize for host CPU (-march=native)" OFF)
+if(ENABLE_NATIVE)
+    add_compile_options(-march=native)
+endif()
+
+if(NOT DEFINED SPDLOG_ACTIVE_LEVEL)
+    set(SPDLOG_ACTIVE_LEVEL "SPDLOG_LEVEL_DEBUG")
+endif()
+add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
 
 add_executable(ElysiaMinecraftGateway ${SRC_FILES} "${CMAKE_CURRENT_BINARY_DIR}/dialog")
 target_compile_options(ElysiaMinecraftGateway PRIVATE -Wno-c23-extensions)
