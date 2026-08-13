@@ -1,2 +1,2 @@
 #pragma once
-static char temp_buf[2048];
+static char temp_buf[4096];

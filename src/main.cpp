@@ -871,39 +871,40 @@ void onEpoll(epoll_event *ep_event) {
           return;
         }
 
-        try {
-          std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
-          PacketReader reader(view);
+        do {
+          try {
+            std::span<unsigned char> view(client->sendbuf.data(), client->sendbuf.size());
+            PacketReader reader(view);
 
-          std::optional<size_t> res = reader.readUncompressed();
-          if (!res.has_value())
-            goto skip;
+            std::optional<size_t> res = reader.readUncompressed();
+            if (!res.has_value())
+              break;
 
-          if (reader.getPacketId() != 0 || *res != client->sendbuf.size()) {
-            SPDLOG_ERROR("[conn#{} client#{}] Backend сервер вернул пакет с некорректным id: {}, или не удалось дочитать пакет до конца: "
-                         "{}, fd = {}",
-                         client->fd, client->connid, reader.getPacketId(), client->sendbuf.size(), client->statusread_fd);
+            if (reader.getPacketId() != 0 || *res != client->sendbuf.size()) {
+              SPDLOG_ERROR("[conn#{} client#{}] Backend сервер вернул пакет с некорректным id: {}, или не удалось дочитать пакет до конца: "
+                           "{}, fd = {}",
+                           client->fd, client->connid, reader.getPacketId(), client->sendbuf.size(), client->statusread_fd);
+              closeConns(client, i);
+              return;
+            }
+
+            close(client->statusread_fd);
+            SPDLOG_INFO("[conn#{} client#{}] Закрыто соединение с backend после успешного чтения статуса, fd = {}", client->fd,
+                        client->connid, client->statusread_fd);
+            client->statusread_fd = -1;
+
+            write(client->fd, client->sendbuf.data(), client->sendbuf.size());
+
+            client->sendbuf.clear();
+            client->sendbuf.shrink_to_fit();
+          } catch (const std::exception &e) {
+            SPDLOG_ERROR("[conn#{} client#{}] Произошла ошибка при парсинга данных от backend сервера: {}, {}", client->fd, client->connid,
+                         *client->routed_server, e.what());
             closeConns(client, i);
             return;
           }
+        } while (0);
 
-          close(client->statusread_fd);
-          SPDLOG_INFO("[conn#{} client#{}] Закрыто соединение с backend после успешного чтения статуса, fd = {}", client->fd,
-                      client->connid, client->statusread_fd);
-          client->statusread_fd = -1;
-
-          write(client->fd, client->sendbuf.data(), client->sendbuf.size());
-
-          client->sendbuf.clear();
-          client->sendbuf.shrink_to_fit();
-        } catch (const std::exception &e) {
-          SPDLOG_ERROR("[conn#{} client#{}] Произошла ошибка при парсинга данных от backend сервера: {}, {}", client->fd, client->connid,
-                       *client->routed_server, e.what());
-          closeConns(client, i);
-          return;
-        }
-
-      skip:
         if (ret == 0 && client->sendbuf.size() > 0) {
           SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft сервер неожиданно закрыл соединение: {}", client->fd, client->connid,
                        *client->routed_server);
@@ -914,8 +915,6 @@ void onEpoll(epoll_event *ep_event) {
         return;
       }
     }
-
-    SPDLOG_DEBUG("Не нашлось сокета для fd = {}", fd);
 
     int action_mask = 0;
     if (event & EPOLLIN)
