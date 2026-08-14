@@ -7,29 +7,30 @@
 
 class Config {
 public:
-  const std::string configFile;
   struct ConfigServer {
     in_port_t port;
     std::string host;
-    std::string domain;
   };
-
-  explicit Config(std::string fileName) : configFile(std::move(fileName)) { load_config_or_exit(); }
+  struct RouteConfig {
+    std::string server;
+    int id_on_server;
+    int id_used_to_ping;
+  };
 
   uint16_t get_web_port() const noexcept { return webPort; }
   uint16_t get_game_port() const noexcept { return gamePort; }
   const std::string get_check_refresh_token_url() const noexcept { return checkRefreshTokenUrl; }
   const std::string get_refresh_url() const noexcept { return refreshUrl; }
 
-  std::optional<std::string *> get_servername_by_domain(const std::string &domain) noexcept;
-  std::optional<struct ConfigServer *> get_server_by_name(const std::string &serverName) noexcept;
+  struct RouteConfig *get_routeconfig_by_domain(const std::string &domain) noexcept;
+  std::vector<struct ConfigServer> *get_server_by_name(const std::string &serverName) noexcept;
+
+  void load_config_or_exit(const std::string &fileName) noexcept;
 
 private:
-  std::flat_map<std::string, std::string> routes;
-  std::flat_map<std::string, struct ConfigServer> servers;
+  std::flat_map<std::string, struct RouteConfig> routes;
+  std::flat_map<std::string, std::vector<struct ConfigServer>> servers;
 
   in_port_t webPort, gamePort;
   std::string checkRefreshTokenUrl, refreshUrl;
-
-  void load_config_or_exit() noexcept;
 };

@@ -50,7 +50,7 @@
 #include "resolv.hpp"
 #include "socket_drainer.hpp"
 
-Config config = Config("config.json");
+Config config;
 static iovec iov[4]; // Нужен 4
 
 enum class ConnectionState : unsigned char { HandShake, Status, Login, Configuration, Play, Died };
@@ -69,8 +69,8 @@ struct MinecraftClient {
   ConnectionState state;
   in6_addr addr;
   std::string username;
-  std::string *routed_server;
-  Config::ConfigServer *routed_server_config;
+  Config::RouteConfig *routed_server;
+  std::vector<Config::ConfigServer> *routed_server_config;
   bool send_dialog;
   std::vector<unsigned char> buf;
 };
@@ -220,7 +220,7 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   // 1. Создаём контекст в куче
   auto *ctx = new RequestContext();
   ctx->is_check_refresh = false;
-  ctx->serverName = *client->routed_server;
+  ctx->serverName = client->routed_server->server;
   ctx->res_fd = client->fd;
 
   // 2. Формируем заголовки (если нужно)
@@ -231,7 +231,7 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   std::string clean_token(decoded, out_len);
   curl_free(decoded);
 
-  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", *client->routed_server}};
+  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", client->routed_server->server}};
 
   // 3. Настраиваем curl easy handle
   curl_easy_setopt(easy, CURLOPT_URL, config.get_refresh_url().c_str());
@@ -280,21 +280,21 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       KILL_CONN;
     }
 
-    auto server_name = config.get_servername_by_domain(handshake.getServerAddress());
-    if (!server_name.has_value()) {
+    auto routeconfig = config.get_routeconfig_by_domain(handshake.getServerAddress());
+    if (routeconfig == NULL) {
       SPDLOG_WARN("[conn#{} client#{}] Не найден домен для подключения пользователя: {}", client->fd, client->connid, clean_address);
       KILL_CONN;
     }
 
-    auto server_config = config.get_server_by_name(*server_name.value());
-    if (!server_config.has_value()) [[unlikely]] {
+    auto server_config = config.get_server_by_name(routeconfig->server);
+    if (server_config == NULL) [[unlikely]] {
       SPDLOG_ERROR("[conn#{} client#{}] Не найден сервер для подключения пользователя: {}", client->fd, client->connid,
-                   *client->routed_server);
+                   client->routed_server->server);
       KILL_CONN;
     }
 
-    client->routed_server = server_name.value();
-    client->routed_server_config = server_config.value();
+    client->routed_server = routeconfig;
+    client->routed_server_config = server_config;
     client->protocol_version = handshake.getProtocolVersion();
 
     if (handshake.getConnectionReason() == ConnectionReason::Status)
@@ -331,7 +331,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       SPDLOG_INFO("[conn#{} client#{}] Получен запрос Status", client->fd, client->connid);
 
       ResolvedAddress res_addr;
-      if (resolve_host(client->routed_server_config->host.c_str(), client->routed_server_config->port, &res_addr) < 0) {
+      if (resolve_host(client->routed_server_config->at(client->routed_server->id_on_server).host.c_str(),
+                       client->routed_server_config->at(client->routed_server->id_on_server).port, &res_addr) < 0) {
         SPDLOG_ERROR("[conn#{} client#{}] Не удалось отрезолвить домен в адресе сервера", client->fd, client->connid);
         KILL_CONN;
       }
@@ -585,7 +586,8 @@ static inline void check_completed_requests() {
 
             PacketWriter packetwriter1 = StoreCookie::encode("eauth:eauth-jwt", token);
             packetwriter1.generate_iovec(iov);
-            PacketWriter packetwriter2 = Transfer::encode(client->routed_server_config->host, client->routed_server_config->port);
+            PacketWriter packetwriter2 = Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
+                                                          client->routed_server_config->at(client->routed_server->id_on_server).port);
             packetwriter2.generate_iovec_to_2(iov + 2);
 
             SPDLOG_INFO(
@@ -829,13 +831,15 @@ void onEpoll(epoll_event *ep_event) {
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
           SPDLOG_ERROR("[conn#{} client#{}] Не удалось установить соединение с backend сервером: fd = {}, server = {}, errno = {}",
-                       client->fd, client->connid, client->statusread_fd, *client->routed_server, std::system_category().message(errno));
+                       client->fd, client->connid, client->statusread_fd, client->routed_server->server,
+                       std::system_category().message(errno));
           closeConns(client, i);
           return;
         }
 
-        PacketWriter handshake = HandShake::encode(client->protocol_version, client->routed_server_config->host,
-                                                   client->routed_server_config->port, ConnectionReason::Status);
+        PacketWriter handshake =
+            HandShake::encode(client->protocol_version, client->routed_server_config->at(client->routed_server->id_used_to_ping).host,
+                              client->routed_server_config->at(client->routed_server->id_used_to_ping).port, ConnectionReason::Status);
         handshake.generate_iovec(iov);
         iov[2].iov_base = (void *)status_request_packet;
         iov[2].iov_len = sizeof(status_request_packet);
@@ -869,7 +873,7 @@ void onEpoll(epoll_event *ep_event) {
 
         if (ret < 0 and errno != EAGAIN) {
           SPDLOG_ERROR("[conn#{} client#{}] Не удалось прочитать данные от backend сервера: fd = {}, server = {}, errno {}", client->fd,
-                       client->connid, client->statusread_fd, *client->routed_server, std::system_category().message(errno));
+                       client->connid, client->statusread_fd, client->routed_server->server, std::system_category().message(errno));
           closeConns(client, i);
           return;
         }
@@ -902,7 +906,7 @@ void onEpoll(epoll_event *ep_event) {
             client->sendbuf.shrink_to_fit();
           } catch (const std::exception &e) {
             SPDLOG_ERROR("[conn#{} client#{}] Произошла ошибка при парсинга данных от backend сервера: {}, {}", client->fd, client->connid,
-                         *client->routed_server, e.what());
+                         client->routed_server->server, e.what());
             closeConns(client, i);
             return;
           }
@@ -910,7 +914,7 @@ void onEpoll(epoll_event *ep_event) {
 
         if (ret == 0 && client->sendbuf.size() > 0) {
           SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft сервер неожиданно закрыл соединение: {}", client->fd, client->connid,
-                       *client->routed_server);
+                       client->routed_server->server);
           closeConns(client, i);
           return;
         }
@@ -968,6 +972,7 @@ int main() {
   std::signal(SIGTERM, signal_handler);
   std::signal(SIGINT, signal_handler);
 
+  config.load_config_or_exit("config.json");
   epoll_fd = epoll_create1(O_CLOEXEC);
 
   tcpfd = init_tcp_socket(config.get_game_port());
