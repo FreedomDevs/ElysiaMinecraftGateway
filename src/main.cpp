@@ -534,7 +534,7 @@ static inline void check_completed_requests() {
             }
 
             if (client == clients.end()) {
-              send(ctx->res_fd, embedded::not_ok_html.data(), embedded::not_ok_html.size(), MSG_MORE);
+              send(ctx->res_fd, embedded::not_found_html.data(), embedded::not_found_html.size(), MSG_MORE);
               close(ctx->res_fd);
               goto clean;
             }

@@ -14,6 +14,14 @@ constexpr unsigned char not_ok_html_raw[] = {
 #embed "html/not_ok.html"
 };
 
+constexpr std::string_view not_found_headers = "HTTP/1.1 404 Player not on server right now\r\n"
+                                               "Content-Type: text/html; charset=utf-8\r\n"
+                                               "Connection: close\r\n"
+                                               "\r\n";
+constexpr unsigned char not_found_html_raw[] = {
+#embed "html/not_found.html"
+};
+
 constexpr std::string_view ok_headers = "HTTP/1.1 200 OK\r\n"
                                         "Content-Type: text/html; charset=utf-8\r\n"
                                         "Connection: close\r\n"
@@ -63,10 +71,13 @@ template <size_t NHeader, size_t NBody> consteval auto make_http_response(std::s
 }
 
 constexpr auto not_ok_html_array = make_http_response<not_ok_headers.size(), sizeof(not_ok_html_raw)>(not_ok_headers, not_ok_html_raw);
+constexpr auto not_found_html_array =
+    make_http_response<not_found_headers.size(), sizeof(not_found_html_raw)>(not_found_headers, not_found_html_raw);
 constexpr auto ok_html_array = make_http_response<ok_headers.size(), sizeof(ok_html_raw)>(ok_headers, ok_html_raw);
 
 namespace embedded {
 const std::span<const unsigned char> dialog{packed.first.data(), packed.second};
 const std::span<const unsigned char> not_ok_html{not_ok_html_array};
+const std::span<const unsigned char> not_found_html{not_found_html_array};
 const std::span<const unsigned char> ok_html{ok_html_array};
 } // namespace embedded
