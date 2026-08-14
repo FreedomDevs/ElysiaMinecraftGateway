@@ -457,7 +457,10 @@ static inline void closeConns(MinecraftClient *client, size_t client_index) {
 
 static inline void onClientUpdate(MinecraftClient *client, size_t client_index) {
   long ret = read(client->fd, temp_buf, sizeof(temp_buf));
-  if (ret < 0 && errno != EAGAIN) [[unlikely]] {
+  if (ret < 0) [[unlikely]] {
+    if (ret == EAGAIN)
+      return;
+
     SPDLOG_ERROR("[conn#{} client#{}] Не удалось вычитать данные клиента: {}", client->fd, client->connid,
                  std::system_category().message(errno));
     closeConns(client, client_index);
