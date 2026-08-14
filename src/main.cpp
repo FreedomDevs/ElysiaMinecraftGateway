@@ -413,6 +413,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       }
 
       client->state = ConnectionState::Configuration;
+      setMinecraftKeepaliveTimerstate(true);
 
       std::optional<PlayerSession> session = storage.get_valid_session(client->username, client->addr);
       if (session.has_value()) {
