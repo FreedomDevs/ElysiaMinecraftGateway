@@ -2,8 +2,10 @@
 #include "../BasePacket.hpp"
 #include "../PacketReader.hpp"
 #include "../PacketWriter.hpp"
+#include "../types/Primitives.hpp"
 #include <stdexcept>
 #include <string>
+#include <sys/uio.h>
 
 enum class ConnectionReason : int { Status = 1, Connnect = 2, Transfer = 3 };
 
@@ -15,7 +17,7 @@ private:
   ConnectionReason connection_reason;
 
 public:
-  void decode(PacketReader reader) {
+  void decode(PacketReader &reader) {
     protocol_version = reader.readVarInt();
     server_address = reader.readString();
     server_port = reader.readUnsignedShort();
@@ -27,16 +29,30 @@ public:
     reader.end();
   };
 
-  static PacketWriter encode(int protocol_version, const std::string &server_address, unsigned short server_port,
-                             ConnectionReason connection_reason) {
-    PacketWriter writer;
-    writer.writePacketId(0);
-    writer.writeVarInt(protocol_version);
-    writer.writeString(server_address);
-    writer.writeUnsignedShort(server_port);
-    writer.writeVarInt((int)connection_reason);
+  static void encode(int protocol_version, const std::string &server_address, unsigned short server_port,
+                     ConnectionReason connection_reason) {
+    int sizeofdata =                                 //
+        VarInt::varint_size(0) +                     // Id
+        VarInt::varint_size(protocol_version) +      // Protocol Version
+        VarInt::varint_size(server_address.size()) + // Strlen
+        server_address.size() +                      // Str
+        PacketSize::Short + 1;                       // Port + ConnectionReason
 
-    return writer;
+    PacketWriter::reserve_size_in_data(PacketSize::VarInt + sizeofdata); // Size + data
+
+    size_t pos = packet_data.size();
+    VarInt::writeVarInt(sizeofdata, packet_data);
+    VarInt::writeVarInt(0, packet_data);
+    VarInt::writeVarInt(protocol_version, packet_data);
+    String::writeString(server_address, packet_data);
+    Primitives::writeUnsignedShort(server_port, packet_data);
+    VarInt::writeVarInt((int)connection_reason, packet_data);
+
+    iovec io;
+    io.iov_base = PacketWriter::build_tagged_int(pos);
+    io.iov_len = packet_data.size() - pos;
+
+    packet_iovec.push_back(io);
   }
 
   int getProtocolVersion() { return protocol_version; }

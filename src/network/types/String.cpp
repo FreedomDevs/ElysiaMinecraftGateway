@@ -17,7 +17,7 @@ std::string_view readString(std::span<unsigned char> data, size_t &offset) {
   return result;
 }
 
-void writeString(const std::string &str, std::vector<unsigned char> &data) {
+void writeString(const std::string_view str, std::vector<unsigned char> &data) {
   std::vector<unsigned char> lengthPrefix;
   VarInt::writeVarInt(str.size(), lengthPrefix);
 

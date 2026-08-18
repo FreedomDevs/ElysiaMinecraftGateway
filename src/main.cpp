@@ -21,6 +21,7 @@
 #include <curl/multi.h>
 #include <exception>
 #include <fcntl.h>
+#include <fmt/format.h>
 #include <iostream>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -45,6 +46,7 @@
 
 #include "epoll_fd.hpp"
 #include "network/curl_init.hpp"
+#include "network/packets/status/StatusResponse.hpp"
 #include "network/sockets.hpp"
 #include "readbuf.hpp"
 #include "resolv.hpp"
@@ -141,10 +143,20 @@ static inline void setMinecraftKeepaliveTimerstate(bool state) {
     }
   } else {
     if (minecraft_keepalive_ts.it_interval.tv_sec == 19) {
-      minecraft_keepalive_ts.it_value.tv_sec = 0;
-      minecraft_keepalive_ts.it_interval.tv_sec = 0;
-      timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
-      SPDLOG_INFO("Таймер на keepalive был отключен");
+      bool configuration = false;
+      for (auto i : clients) {
+        if (i.state == ConnectionState::Configuration) {
+          configuration = true;
+          break;
+        }
+      }
+
+      if (!configuration) {
+        minecraft_keepalive_ts.it_value.tv_sec = 0;
+        minecraft_keepalive_ts.it_interval.tv_sec = 0;
+        timerfd_settime(minecraft_keepalive_timerfd, 0, &minecraft_keepalive_ts, NULL);
+        SPDLOG_INFO("Таймер на keepalive был отключен");
+      }
     }
   }
 }
@@ -372,8 +384,6 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       StatusPing req;
       req.decode(packet);
 
-      SPDLOG_DEBUG("[conn#{} client#{}] Получен Ping запрос от клиента", client->fd, client->connid);
-
       PacketWriter writer = StatusPong::encode(req.getPayload());
       writer.generate_iovec(iov);
 
@@ -383,7 +393,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
       sendmsg(client->fd, &msg, MSG_MORE);
       close(client->fd);
-      SPDLOG_INFO("[conn#{} client#{}] Вернули Pong клиенту, и закрыли соединение", client->fd, client->connid);
+      SPDLOG_INFO("[conn#{} client#{}] Вернули Pong клиенту в ответ на Ping, и закрыли соединение", client->fd, client->connid);
 
       client->fd = -1;
       client->state = ConnectionState::Died;
@@ -585,20 +595,15 @@ static inline void check_completed_requests() {
               goto clean1;
             }
 
-            PacketWriter packetwriter1 = StoreCookie::encode("eauth:eauth-jwt", token);
-            packetwriter1.generate_iovec(iov);
-            PacketWriter packetwriter2 = Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
-                                                          client->routed_server_config->at(client->routed_server->id_on_server).port);
-            packetwriter2.generate_iovec_to_2(iov + 2);
+            StoreCookie::encode_separated("eauth:eauth-jwt", token);
+            Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
+                             client->routed_server_config->at(client->routed_server->id_on_server).port);
 
             SPDLOG_INFO(
                 "[conn#{} client#{}] Получен access токен через curl по fd: {}, HTTP статус: {}, клиент редиректнут, соединение закрыто",
                 client->fd, client->connid, ctx->res_fd, response_code);
 
-            struct msghdr msg{};
-            msg.msg_iov = iov;
-            msg.msg_iovlen = 4; // 4 io мы использовали
-            sendmsg(client->fd, &msg, MSG_MORE);
+            PacketWriter::send_with_more(client->fd);
             close(client->fd);
             client->fd = -1;
 
@@ -616,6 +621,7 @@ static inline void check_completed_requests() {
         clean1:
           for (size_t i = 0; i < clients.size(); i++) {
             if (clients[i].fd == ctx->res_fd) {
+              SPDLOG_DEBUG("Чистим чета");
               closeConns(&clients[i], i);
               break;
             }
@@ -834,23 +840,25 @@ void onEpoll(epoll_event *ep_event) {
           SPDLOG_ERROR("[conn#{} client#{}] Не удалось установить соединение с backend сервером: fd = {}, server = {}, errno = {}",
                        client->fd, client->connid, client->statusread_fd, client->routed_server->server,
                        std::system_category().message(errno));
-          closeConns(client, i);
+
+          std::string data = std::format(R"({{"description":{{"text":"errno = {}"}}}})", std::system_category().message(errno));
+          StatusResponse::encode_separeted(data);
+          PacketWriter::send_to_fd(client->fd);
+
+          client->statusread_state = StatusReadState::Connection;
+          close(client->statusread_fd);
+          client->statusread_fd = -1;
           return;
         }
 
-        PacketWriter handshake =
-            HandShake::encode(client->protocol_version, client->routed_server_config->at(client->routed_server->id_used_to_ping).host,
-                              client->routed_server_config->at(client->routed_server->id_used_to_ping).port, ConnectionReason::Status);
-        handshake.generate_iovec(iov);
-        iov[2].iov_base = (void *)status_request_packet;
-        iov[2].iov_len = sizeof(status_request_packet);
-
-        msghdr msg = {};
-        msg.msg_iov = iov;
-        msg.msg_iovlen = 3;
+        HandShake::encode(client->protocol_version, client->routed_server_config->at(client->routed_server->id_used_to_ping).host,
+                          client->routed_server_config->at(client->routed_server->id_used_to_ping).port, ConnectionReason::Status);
+        packet_data.insert(packet_data.end(), status_request_packet, status_request_packet + sizeof(status_request_packet));
+        packet_iovec[0].iov_len += sizeof(status_request_packet);
 
         SPDLOG_INFO("[conn#{} client#{}] Отправляем handshake на сервер: fd = {}", client->fd, client->connid, client->statusread_fd);
-        sendmsg(client->statusread_fd, &msg, MSG_MORE);
+
+        PacketWriter::send_with_more(client->statusread_fd);
         shutdown(client->statusread_fd, SHUT_WR);
 
         ev.events = EPOLLIN;
