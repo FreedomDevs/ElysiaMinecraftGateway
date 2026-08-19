@@ -839,9 +839,9 @@ void onEpoll(epoll_event *ep_event) {
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
           SPDLOG_ERROR("[conn#{} client#{}] Не удалось установить соединение с backend сервером: fd = {}, server = {}, errno = {}",
                        client->fd, client->connid, client->statusread_fd, client->routed_server->server,
-                       std::system_category().message(errno));
+                       std::system_category().message(err));
 
-          std::string data = std::format(R"({{"description":{{"text":"errno = {}"}}}})", std::system_category().message(errno));
+          std::string data = std::format(R"({{"description":{{"text":"errno = {}"}}}})", std::system_category().message(err));
           StatusResponse::encode_separeted(data);
           PacketWriter::send_to_fd(client->fd);
 
@@ -913,6 +913,7 @@ void onEpoll(epoll_event *ep_event) {
 
             client->sendbuf.clear();
             client->sendbuf.shrink_to_fit();
+            return;
           } catch (const std::exception &e) {
             SPDLOG_ERROR("[conn#{} client#{}] Произошла ошибка при парсинга данных от backend сервера: {}, {}", client->fd, client->connid,
                          client->routed_server->server, e.what());
