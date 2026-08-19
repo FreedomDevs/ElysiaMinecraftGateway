@@ -14,6 +14,7 @@ public:
     VarInt::writeVarInt(packet_size, packet_data);
     VarInt::writeVarInt(10, packet_data);
     String::writeString(identificator, packet_data);
+    VarInt::writeVarInt(data.size(), packet_data);
 
     iovec io;
     io.iov_base = PacketWriter::build_tagged_int(pos);
