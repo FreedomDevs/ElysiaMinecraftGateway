@@ -14,6 +14,7 @@
 #include "network/packets/status/StatusRequest.hpp"
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -67,19 +68,21 @@ struct MinecraftClient {
   int protocol_version;
   int statusread_fd;
   std::vector<unsigned char> sendbuf;
-  StatusReadState statusread_state;
-  ConnectionState state;
   in6_addr addr;
   std::string username;
   Config::RouteConfig *routed_server;
+  std::chrono::steady_clock::time_point last_seen;
   std::vector<Config::ConfigServer> *routed_server_config;
-  bool send_dialog;
   std::vector<unsigned char> buf;
+  bool send_dialog;
+  StatusReadState statusread_state;
+  ConnectionState state;
 };
 
 struct WebClient {
   int fd;
   uint32_t connid;
+  std::chrono::steady_clock::time_point last_seen;
 };
 
 struct RequestContext {
@@ -283,8 +286,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
     handshake.decode(packet);
 
     std::string clean_address = sanitize_for_log(handshake.getServerAddress());
-    SPDLOG_INFO("[conn#{} client#{}] Получен Handshake, адрес: {}, версия протокола: {}, причина подключения: {}", client->fd,
-                client->connid, clean_address, handshake.getProtocolVersion(), (int)handshake.getConnectionReason());
+    SPDLOG_INFO("[conn#{} client#{}] Получен Handshake, {}, {}, {}", client->fd, client->connid, clean_address,
+                handshake.getProtocolVersion(), (int)handshake.getConnectionReason());
 
     if (handshake.getServerPort() != config.get_game_port()) {
       SPDLOG_WARN("[conn#{} client#{}] Некорректный порт для подключения, ожидался: {}, получен: {}", client->fd, client->connid,
@@ -453,7 +456,7 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 #undef KILL_CONN
 }
 
-static inline void closeConns(MinecraftClient *client, size_t client_index) {
+static inline void onlyCloseConns(MinecraftClient *client) {
   if (client->fd >= 0) {
     close(client->fd);
     SPDLOG_INFO("[conn#{} client#{}] Соединение закрыто", client->fd, client->connid);
@@ -464,6 +467,10 @@ static inline void closeConns(MinecraftClient *client, size_t client_index) {
   }
 
   setMinecraftKeepaliveTimerstate(false);
+}
+
+static inline void closeConns(MinecraftClient *client, size_t client_index) {
+  onlyCloseConns(client);
   clients.erase(clients.begin() + client_index);
 }
 
@@ -771,6 +778,7 @@ void onEpoll(epoll_event *ep_event) {
     client.statusread_fd = -1;
     client.connid = last_connid++;
     client.addr = sockaddr_addr.sin6_addr;
+    client.last_seen = std::chrono::steady_clock::now();
 
     inet_ntop(AF_INET6, &client.addr, ipv6_str, sizeof(ipv6_str));
     SPDLOG_INFO("[conn#{}, client#{}] Minecraft client connected: {}", client.fd, client.connid, ipv6_str);
@@ -788,6 +796,7 @@ void onEpoll(epoll_event *ep_event) {
     }
 
     client.connid = last_connid++;
+    client.last_seen = std::chrono::steady_clock::now();
 
     SPDLOG_INFO("[conn#{}, client#{}] Web client connected", client.fd, client.connid);
     web_clients.push_back(client);
@@ -806,9 +815,10 @@ void onEpoll(epoll_event *ep_event) {
 
     for (auto &client : clients) {
       if (client.state == ConnectionState::Configuration) {
+        client.last_seen = std::chrono::steady_clock::now();
         ssize_t ret = write(client.fd, keepalivepacket, sizeof(keepalivepacket));
         if (ret != sizeof(keepalivepacket)) { // -1 или меньше чем sizeof(keepalivepacket)
-          close(client.fd);
+          onlyCloseConns(&client);
           client.state = ConnectionState::Died;
         }
       }
@@ -820,6 +830,7 @@ void onEpoll(epoll_event *ep_event) {
   } else {
     for (size_t i = 0; i < web_clients.size(); i++) {
       struct WebClient *client = &web_clients[i];
+      client->last_seen = std::chrono::steady_clock::now();
       if (fd == client->fd) {
         onWebClientUpdate(client, i);
         return;
@@ -828,6 +839,7 @@ void onEpoll(epoll_event *ep_event) {
 
     for (size_t i = 0; i < clients.size(); i++) {
       struct MinecraftClient *client = &clients[i];
+      client->last_seen = std::chrono::steady_clock::now();
       if (fd == client->fd) {
         onClientUpdate(client, i);
         return;
@@ -948,6 +960,26 @@ void onEpoll(epoll_event *ep_event) {
   }
 }
 
+void kill_stale() {
+  auto staleif = std::chrono::steady_clock::now() - std::chrono::minutes(1);
+
+  for (auto &client : clients) {
+    if (client.last_seen < staleif) {
+      onlyCloseConns(&client);
+      client.state = ConnectionState::Died;
+    }
+  }
+  for (auto &client : web_clients) {
+    if (client.last_seen < staleif) {
+      close(client.fd);
+      client.fd = -1;
+    }
+  }
+
+  std::erase_if(clients, [](const MinecraftClient &c) { return c.state == ConnectionState::Died; });
+  std::erase_if(web_clients, [](const WebClient &c) { return c.fd == -1; });
+}
+
 class custom_level_formatter : public spdlog::custom_flag_formatter {
 public:
   void format(const spdlog::details::log_msg &msg, const std::tm &, spdlog::memory_buf_t &dest) override {
@@ -998,6 +1030,7 @@ int main() {
     for (int i = 0; i < count; i++)
       onEpoll(events + i);
 
+    kill_stale();
     draining_sockets::clean();
   }
 

@@ -19,7 +19,6 @@ inline msghdr *gen_msg_by_iovec() {
 }
 
 static inline std::vector<unsigned char> minecraft_header(5);
-static inline std::vector<unsigned char> minecraft_header1(5);
 
 namespace PacketSize {
 constexpr size_t VarInt = 5;
@@ -45,15 +44,6 @@ public:
     VarInt::writeVarInt(data.size(), minecraft_header);
     io->iov_base = minecraft_header.data();
     io->iov_len = minecraft_header.size();
-
-    (io + 1)->iov_base = data.data();
-    (io + 1)->iov_len = data.size();
-  }
-  void generate_iovec_to_2(iovec *__restrict io) { // Должен быть доступен io и io+1
-    minecraft_header1.clear();
-    VarInt::writeVarInt(data.size(), minecraft_header1);
-    io->iov_base = minecraft_header1.data();
-    io->iov_len = minecraft_header1.size();
 
     (io + 1)->iov_base = data.data();
     (io + 1)->iov_len = data.size();

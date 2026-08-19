@@ -10,6 +10,7 @@ pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
     ninja
     nlohmann_json
     spdlog
+    pahole
   ];
 
   buildInputs = with pkgs; [
