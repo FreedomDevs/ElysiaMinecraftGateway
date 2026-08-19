@@ -497,7 +497,6 @@ static inline void onClientUpdate(MinecraftClient *client, size_t client_index) 
         return;
       }
 
-      SPDLOG_DEBUG("[conn#{} client#{}] В буфере было: {}, было прочитано: {}", client->fd, client->connid, client->buf.size(), *ret);
       memmove(client->buf.data(), client->buf.data() + *ret, client->buf.size() - *ret);
       client->buf.resize(client->buf.size() - *ret);
     }
@@ -606,6 +605,7 @@ static inline void check_completed_requests() {
             PacketWriter::send_with_more(client->fd);
             close(client->fd);
             client->fd = -1;
+            client->state = ConnectionState::Died;
 
           } catch (const std::exception &e) {
             SPDLOG_ERROR("Ошибка парсинга JSON: {}", e.what());
@@ -921,7 +921,7 @@ void onEpoll(epoll_event *ep_event) {
           }
         } while (0);
 
-        if (ret == 0 && client->sendbuf.size() > 0) {
+        if (ret == 0) {
           SPDLOG_ERROR("[conn#{} client#{}] Backend minecraft сервер неожиданно закрыл соединение: {}", client->fd, client->connid,
                        client->routed_server->server);
           closeConns(client, i);
