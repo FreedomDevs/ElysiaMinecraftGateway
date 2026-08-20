@@ -20,6 +20,7 @@ int cb_socket_action(CURL * /*easy*/, curl_socket_t s, int action, void * /*user
   } else if (action == CURL_POLL_REMOVE) {
     // Удаляем сокет из epoll
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, s, nullptr);
+    SPDLOG_DEBUG("Удалён curl сокет: {}", s);
     return 0;
   }
 

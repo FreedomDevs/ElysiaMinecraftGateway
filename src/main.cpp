@@ -531,15 +531,19 @@ static inline void check_completed_requests() {
       CURL *easy_handle = msg->easy_handle;
       CURLcode result = msg->data.result;
 
+      SPDLOG_DEBUG("Получаем контекст для");
+
       // 1. Достаем наш контекст с токеном обратно!
       RequestContext *ctx = nullptr;
       curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &ctx);
 
+      SPDLOG_DEBUG("Получен res_fd: {}", ctx->res_fd);
       if (result == CURLE_OK) {
         long response_code = 0;
         curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
 
         if (ctx->is_check_refresh) {
+          SPDLOG_DEBUG("Refresh");
           try {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
@@ -553,6 +557,8 @@ static inline void check_completed_requests() {
                 break;
               }
             }
+
+            SPDLOG_DEBUG("5");
 
             if (client == clients.end()) {
               send(ctx->res_fd, embedded::not_found_html.data(), embedded::not_found_html.size(), MSG_MORE);
@@ -575,6 +581,7 @@ static inline void check_completed_requests() {
           send(ctx->res_fd, embedded::ok_html.data(), embedded::ok_html.size(), MSG_MORE);
           close(ctx->res_fd);
         clean:
+          SPDLOG_DEBUG("Clean");
           for (auto i = web_clients.begin(); i < web_clients.end(); i++) {
             if (i->fd == ctx->res_fd) {
               web_clients.erase(i);
