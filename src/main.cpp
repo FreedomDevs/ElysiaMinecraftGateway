@@ -531,8 +531,6 @@ static inline void check_completed_requests() {
       CURL *easy_handle = msg->easy_handle;
       CURLcode result = msg->data.result;
 
-      SPDLOG_DEBUG("Получаем контекст для");
-
       // 1. Достаем наш контекст с токеном обратно!
       RequestContext *ctx = nullptr;
       curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &ctx);
@@ -589,6 +587,7 @@ static inline void check_completed_requests() {
             }
           }
         } else {
+          SPDLOG_DEBUG("Norefresh");
           try {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
