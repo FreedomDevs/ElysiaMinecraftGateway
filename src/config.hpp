@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <flat_map>
 #include <netinet/in.h>
 #include <nlohmann/json.hpp>
@@ -8,13 +10,14 @@
 class Config {
 public:
   struct ConfigServer {
-    in_port_t port;
     std::string host;
+    in_port_t port;
   };
   struct RouteConfig {
     std::string server;
     int id_on_server;
     int id_used_to_ping;
+    size_t statid;
   };
 
   uint16_t get_web_port() const noexcept { return webPort; }

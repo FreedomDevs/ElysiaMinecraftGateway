@@ -50,6 +50,8 @@ st:;
             routes[el.key()].id_on_server = eq.value();
           else if (eq.key() == "id_used_to_ping")
             routes[el.key()].id_used_to_ping = eq.value();
+          else if (eq.key() == "statid")
+            routes[el.key()].statid = eq.value();
           else
             SPDLOG_WARN("Неиспользованный параметр конфига: {}", eq.key());
         }
