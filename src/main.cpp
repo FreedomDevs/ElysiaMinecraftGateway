@@ -535,13 +535,11 @@ static inline void check_completed_requests() {
       RequestContext *ctx = nullptr;
       curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &ctx);
 
-      SPDLOG_DEBUG("Получен res_fd: {}", ctx->res_fd);
       if (result == CURLE_OK) {
         long response_code = 0;
         curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
 
         if (ctx->is_check_refresh) {
-          SPDLOG_DEBUG("Refresh");
           try {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
@@ -555,8 +553,6 @@ static inline void check_completed_requests() {
                 break;
               }
             }
-
-            SPDLOG_DEBUG("5");
 
             if (client == clients.end()) {
               send(ctx->res_fd, embedded::not_found_html.data(), embedded::not_found_html.size(), MSG_MORE);
@@ -579,7 +575,6 @@ static inline void check_completed_requests() {
           send(ctx->res_fd, embedded::ok_html.data(), embedded::ok_html.size(), MSG_MORE);
           close(ctx->res_fd);
         clean:
-          SPDLOG_DEBUG("Clean");
           for (auto i = web_clients.begin(); i < web_clients.end(); i++) {
             if (i->fd == ctx->res_fd) {
               web_clients.erase(i);
@@ -587,7 +582,7 @@ static inline void check_completed_requests() {
             }
           }
         } else {
-          SPDLOG_DEBUG("Norefresh");
+          SPDLOG_DEBUG("Получен res_fd: {}", ctx->res_fd);
           try {
             // Парсим строку в объект json
             nlohmann::json data = nlohmann::json::parse(ctx->response_body);
@@ -602,16 +597,17 @@ static inline void check_completed_requests() {
               }
             }
 
-            SPDLOG_DEBUG("1");
             if (client == clients.end()) {
               close(ctx->res_fd);
               goto clean1;
             }
 
-            SPDLOG_DEBUG("2");
+            SPDLOG_DEBUG("1");
             StoreCookie::encode_separated("eauth:eauth-jwt", token);
+            SPDLOG_DEBUG("4");
             Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
                              client->routed_server_config->at(client->routed_server->id_on_server).port);
+            SPDLOG_DEBUG("7");
 
             SPDLOG_INFO(
                 "[conn#{} client#{}] Получен access токен через curl по fd: {}, HTTP статус: {}, клиент редиректнут, соединение закрыто",

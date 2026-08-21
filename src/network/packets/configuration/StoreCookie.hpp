@@ -10,12 +10,14 @@ public:
                       VarInt::varint_size(data.size()) + data.size();
     PacketWriter::reserve_size_in_data(PacketSize::VarInt + packet_size);
 
+    SPDLOG_DEBUG("2");
     size_t pos = packet_data.size();
     VarInt::writeVarInt(packet_size, packet_data);
     VarInt::writeVarInt(10, packet_data);
     String::writeString(identificator, packet_data);
     VarInt::writeVarInt(data.size(), packet_data);
 
+    SPDLOG_DEBUG("3");
     iovec io;
     io.iov_base = PacketWriter::build_tagged_int(pos);
     io.iov_len = packet_data.size() - pos;
