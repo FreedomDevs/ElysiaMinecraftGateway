@@ -602,12 +602,18 @@ static inline void check_completed_requests() {
               goto clean1;
             }
 
-            SPDLOG_DEBUG("1");
+            if (client->routed_server_config == nullptr) {
+              throw std::runtime_error("Сервер конфиг null");
+            }
+            if (client->routed_server == nullptr) {
+              throw std::runtime_error("Серверnull");
+            }
+
             StoreCookie::encode_separated("eauth:eauth-jwt", token);
+
             SPDLOG_DEBUG("4");
             Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
                              client->routed_server_config->at(client->routed_server->id_on_server).port);
-            SPDLOG_DEBUG("7");
 
             SPDLOG_INFO(
                 "[conn#{} client#{}] Получен access токен через curl по fd: {}, HTTP статус: {}, клиент редиректнут, соединение закрыто",
