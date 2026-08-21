@@ -602,11 +602,13 @@ static inline void check_completed_requests() {
               }
             }
 
+            SPDLOG_DEBUG("1");
             if (client == clients.end()) {
               close(ctx->res_fd);
               goto clean1;
             }
 
+            SPDLOG_DEBUG("2");
             StoreCookie::encode_separated("eauth:eauth-jwt", token);
             Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
                              client->routed_server_config->at(client->routed_server->id_on_server).port);
@@ -632,6 +634,7 @@ static inline void check_completed_requests() {
             goto clean1;
           }
         clean1:
+          SPDLOG_DEBUG("3");
           for (size_t i = 0; i < clients.size(); i++) {
             if (clients[i].fd == ctx->res_fd) {
               SPDLOG_DEBUG("Чистим чета");
