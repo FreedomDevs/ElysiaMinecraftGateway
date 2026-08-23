@@ -562,7 +562,7 @@ static inline void check_completed_requests() {
 
             SPDLOG_INFO("[conn#{} client#{}] Получен refresh токен через curl по fd: {}, HTTP статус: {}", client->fd, client->connid,
                         ctx->res_fd, response_code);
-            storage.save_token(username, client->addr, ctx->token, std::chrono::seconds(30 * 24 * 60 * 60));
+            storage.save_token(username, client->addr, ctx->token, std::chrono::seconds(7 * 24 * 60 * 60));
             routePlayer(ctx->token, &*client);
           } catch (const std::exception &e) {
             SPDLOG_CRITICAL("Ошибка парсинга JSON: {}", e.what());
