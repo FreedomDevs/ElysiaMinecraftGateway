@@ -246,7 +246,7 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   std::string clean_token(decoded, out_len);
   curl_free(decoded);
 
-  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", client->routed_server->server}, {"ttl", 10}};
+  nlohmann::json body = {{"refresh_token", clean_token}, {"serverName", client->routed_server->server}, {"ttl", 30}};
 
   // 3. Настраиваем curl easy handle
   curl_easy_setopt(easy, CURLOPT_URL, config.get_refresh_url().c_str());
