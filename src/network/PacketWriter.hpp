@@ -70,20 +70,44 @@ public:
 
   static void send_to_fd(const int fd) {
     build_iovec();
-    if (packet_iovec.size() == 1)
-      write(fd, packet_iovec[0].iov_base, packet_iovec[0].iov_len);
-    else
-      writev(fd, packet_iovec.data(), packet_iovec.size());
+    if (packet_iovec.size() == 1) {
+      if (write(fd, packet_iovec[0].iov_base, packet_iovec[0].iov_len) != (ssize_t)packet_iovec[0].iov_len) {
+        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью");
+        throw std::runtime_error("Клиент не смог поймать пакет");
+      }
+    } else {
+      ssize_t total_bytes = 0;
+      for (size_t i = 0; i < packet_iovec.size(); i++) {
+        total_bytes += packet_iovec[i].iov_len;
+      }
+
+      if (writev(fd, packet_iovec.data(), packet_iovec.size()) != total_bytes) {
+        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью");
+        throw std::runtime_error("Клиент не смог поймать пакет");
+      }
+    }
 
     clean_packets();
   }
 
   static void send_with_more(const int fd) {
     build_iovec();
-    if (packet_iovec.size() == 1)
-      send(fd, packet_iovec[0].iov_base, packet_iovec[0].iov_len, MSG_MORE);
-    else
-      sendmsg(fd, gen_msg_by_iovec(), MSG_MORE);
+    if (packet_iovec.size() == 1) {
+      if (send(fd, packet_iovec[0].iov_base, packet_iovec[0].iov_len, MSG_MORE) != (ssize_t)packet_iovec[0].iov_len) {
+        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью");
+        throw std::runtime_error("Клиент не смог поймать пакет");
+      }
+    } else {
+      ssize_t total_bytes = 0;
+      for (size_t i = 0; i < packet_iovec.size(); i++) {
+        total_bytes += packet_iovec[i].iov_len;
+      }
+
+      if (sendmsg(fd, gen_msg_by_iovec(), MSG_MORE) != total_bytes) {
+        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью");
+        throw std::runtime_error("Клиент не смог поймать пакет");
+      }
+    }
 
     clean_packets();
   }
