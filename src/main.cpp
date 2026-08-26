@@ -611,7 +611,7 @@ static inline void check_completed_requests() {
 
             StoreCookie::encode_separated("eauth:eauth-jwt", token);
 
-            SPDLOG_DEBUG("4");
+            SPDLOG_DEBUG("1");
             Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
                              client->routed_server_config->at(client->routed_server->id_on_server).port);
 
@@ -636,10 +636,8 @@ static inline void check_completed_requests() {
             goto clean1;
           }
         clean1:
-          SPDLOG_DEBUG("3");
           for (size_t i = 0; i < clients.size(); i++) {
             if (clients[i].fd == ctx->res_fd) {
-              SPDLOG_DEBUG("Чистим чета");
               closeConns(&clients[i], i);
               break;
             }
@@ -647,6 +645,13 @@ static inline void check_completed_requests() {
         }
       } else {
         SPDLOG_ERROR("Ошибка cURL: {}", curl_easy_strerror(result));
+        for (size_t i = 0; i < clients.size(); i++) {
+          if (clients[i].fd == ctx->res_fd) {
+            closeConns(&clients[i], i);
+            break;
+          }
+        }
+        break;
       }
 
       // 2. ОБЯЗАТЕЛЬНО: удаляем handle из multi и чистим память
