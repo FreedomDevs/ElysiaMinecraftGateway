@@ -252,6 +252,10 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   curl_easy_setopt(easy, CURLOPT_URL, config.get_refresh_url().c_str());
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
 
+  curl_easy_setopt(easy, CURLOPT_FORBID_REUSE, 1L);
+  curl_easy_setopt(easy, CURLOPT_FRESH_CONNECT, 1L);
+  curl_easy_setopt(easy, CURLOPT_TCP_FASTOPEN, 1L);
+
   ctx->payload = body.dump();
   curl_easy_setopt(easy, CURLOPT_POST, 1L);
   curl_easy_setopt(easy, CURLOPT_POSTFIELDS, ctx->payload.c_str());
@@ -753,6 +757,10 @@ static inline void onWebClientUpdate(WebClient *client, size_t client_index) {
     // 3. Настраиваем curl easy handle
     curl_easy_setopt(easy, CURLOPT_URL, config.get_check_refresh_token_url().c_str());
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, ctx->headers);
+
+    curl_easy_setopt(easy, CURLOPT_FORBID_REUSE, 1L);
+    curl_easy_setopt(easy, CURLOPT_FRESH_CONNECT, 1L);
+    curl_easy_setopt(easy, CURLOPT_TCP_FASTOPEN, 1L);
 
     ctx->payload = body.dump();
     curl_easy_setopt(easy, CURLOPT_POST, 1L);
