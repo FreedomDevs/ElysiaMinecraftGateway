@@ -94,8 +94,8 @@ public:
     build_iovec();
     if (packet_iovec.size() == 1) {
       if (send(fd, packet_iovec[0].iov_base, packet_iovec[0].iov_len, MSG_MORE) != (ssize_t)packet_iovec[0].iov_len) {
-        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью");
-        throw std::runtime_error("Клиент не смог поймать пакет");
+        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью", fd, (ssize_t)packet_iovec[0].iov_len);
+        // throw std::runtime_error("Клиент не смог поймать пакет");
       }
     } else {
       ssize_t total_bytes = 0;
@@ -104,8 +104,8 @@ public:
       }
 
       if (sendmsg(fd, gen_msg_by_iovec(), MSG_MORE) != total_bytes) {
-        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью");
-        throw std::runtime_error("Клиент не смог поймать пакет");
+        SPDLOG_ERROR("[conn#{}] Не смог поймать пакет полностью, {}", fd, total_bytes);
+        // throw std::runtime_error("Клиент не смог поймать пакет");
       }
     }
 
