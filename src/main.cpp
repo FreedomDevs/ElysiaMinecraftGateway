@@ -274,6 +274,13 @@ static inline void routePlayer(const std::string &refresh_token, MinecraftClient
   curl_multi_add_handle(multi_handle, easy);
 }
 
+void sanitize_host(std::string &host) {
+  size_t null_pos = host.find('\0');
+  if (null_pos != std::string::npos) {
+    host.resize(null_pos); // Обрезает строку за O(1)
+  }
+}
+
 static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 #define KILL_CONN                                                                                                                          \
   do {                                                                                                                                     \
@@ -299,6 +306,8 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
       KILL_CONN;
     }
 
+    std::string address = handshake.getServerAddress();
+    sanitize_host(address);
     auto routeconfig = config.get_routeconfig_by_domain(handshake.getServerAddress());
     if (routeconfig == NULL) {
       SPDLOG_WARN("[conn#{} client#{}] Не найден домен для подключения пользователя: {}", client->fd, client->connid, clean_address);
