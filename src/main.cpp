@@ -308,9 +308,10 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
 
     std::string address = handshake.getServerAddress();
     sanitize_host(address);
-    auto routeconfig = config.get_routeconfig_by_domain(handshake.getServerAddress());
+    auto routeconfig = config.get_routeconfig_by_domain(address);
+    std::string clean_address2 = sanitize_for_log(handshake.getServerAddress());
     if (routeconfig == NULL) {
-      SPDLOG_WARN("[conn#{} client#{}] Не найден домен для подключения пользователя: {}", client->fd, client->connid, clean_address);
+      SPDLOG_WARN("[conn#{} client#{}] Не найден домен для подключения пользователя: {}", client->fd, client->connid, clean_address2);
       KILL_CONN;
     }
 
