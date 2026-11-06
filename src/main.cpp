@@ -447,7 +447,10 @@ static inline void onPacket(MinecraftClient *client, PacketReader &packet) {
         routePlayer(session->refresh_token, client);
       } else {
         client->send_dialog = true;
-        write(client->fd, embedded::dialog.data(), embedded::dialog.size());
+        if (client->protocol_version >= 777)
+          write(client->fd, embedded::dialog1.data(), embedded::dialog1.size());
+        else
+          write(client->fd, embedded::dialog.data(), embedded::dialog.size());
       }
     } else {
       SPDLOG_INFO("[conn#{} client#{}] Получен login пакет с некорректным id: {}", client->fd, client->connid, packet.getPacketId());
@@ -623,11 +626,11 @@ static inline void check_completed_requests() {
               throw std::runtime_error("Серверnull");
             }
 
-            StoreCookie::encode_separated("eauth:eauth-jwt", token);
+            StoreCookie::encode_separated("eauth:eauth-jwt", token, client->protocol_version);
 
             SPDLOG_DEBUG("1");
             Transfer::encode(client->routed_server_config->at(client->routed_server->id_on_server).host,
-                             client->routed_server_config->at(client->routed_server->id_on_server).port);
+                             client->routed_server_config->at(client->routed_server->id_on_server).port, client->protocol_version);
 
             SPDLOG_INFO(
                 "[conn#{} client#{}] Получен access токен через curl по fd: {}, HTTP статус: {}, клиент редиректнут, соединение закрыто",

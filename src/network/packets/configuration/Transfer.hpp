@@ -6,16 +6,17 @@
 
 class Transfer : public BasePacket {
 public:
-  static void encode(std::string domain, uint16_t port) {
+  static void encode(std::string domain, uint16_t port, const int protocol_version) {
     SPDLOG_DEBUG("2");
-    int packet_size = VarInt::varint_size(11) + VarInt::varint_size(domain.size()) + domain.size() + VarInt::varint_size(port);
+    int packet_size = VarInt::varint_size(protocol_version >= 777 ? 12 : 11) + VarInt::varint_size(domain.size()) + domain.size() +
+                      VarInt::varint_size(port);
     SPDLOG_DEBUG("3");
     PacketWriter::reserve_size_in_data(PacketSize::VarInt + packet_size);
 
     SPDLOG_DEBUG("4");
     size_t pos = packet_data.size();
     VarInt::writeVarInt(packet_size, packet_data);
-    VarInt::writeVarInt(11, packet_data);
+    VarInt::writeVarInt(protocol_version >= 777 ? 12 : 11, packet_data);
     String::writeString(domain, packet_data);
     VarInt::writeVarInt(port, packet_data);
 

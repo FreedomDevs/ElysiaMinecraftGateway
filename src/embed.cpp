@@ -5,6 +5,10 @@ constexpr unsigned char dialog_raw[] = {
     0x12, // ID 18
 #embed "../build/dialog"
 };
+constexpr unsigned char dialog_raw1[] = {
+    0x13, // ID 19
+#embed "../build/dialog"
+};
 
 constexpr std::string_view not_ok_headers = "HTTP/1.1 400 Not OK\r\n"
                                             "Content-Type: text/html; charset=utf-8\r\n"
@@ -60,6 +64,7 @@ template <size_t N> consteval auto buildFullPacket(const unsigned char (&body)[N
 }
 
 constexpr auto packed = buildFullPacket(dialog_raw);
+constexpr auto packed1 = buildFullPacket(dialog_raw1);
 
 template <size_t NHeader, size_t NBody> consteval auto make_http_response(std::string_view head, const unsigned char (&body)[NBody]) {
   std::array<unsigned char, NHeader + NBody> result{};
@@ -77,6 +82,7 @@ constexpr auto ok_html_array = make_http_response<ok_headers.size(), sizeof(ok_h
 
 namespace embedded {
 const std::span<const unsigned char> dialog{packed.first.data(), packed.second};
+const std::span<const unsigned char> dialog1{packed1.first.data(), packed1.second};
 const std::span<const unsigned char> not_ok_html{not_ok_html_array};
 const std::span<const unsigned char> not_found_html{not_found_html_array};
 const std::span<const unsigned char> ok_html{ok_html_array};

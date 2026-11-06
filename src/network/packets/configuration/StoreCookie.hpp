@@ -5,14 +5,14 @@
 
 class StoreCookie : public BasePacket {
 public:
-  static void encode_separated(const std::string_view identificator, const std::string_view data) {
-    int packet_size = VarInt::varint_size(10) + VarInt::varint_size(identificator.size()) + identificator.size() +
-                      VarInt::varint_size(data.size()) + data.size();
+  static void encode_separated(const std::string_view identificator, const std::string_view data, const int protocol_version) {
+    int packet_size = VarInt::varint_size(protocol_version >= 777 ? 11 : 10) + VarInt::varint_size(identificator.size()) +
+                      identificator.size() + VarInt::varint_size(data.size()) + data.size();
     PacketWriter::reserve_size_in_data(PacketSize::VarInt + packet_size);
 
     size_t pos = packet_data.size();
     VarInt::writeVarInt(packet_size, packet_data);
-    VarInt::writeVarInt(10, packet_data);
+    VarInt::writeVarInt(protocol_version >= 777 ? 11 : 10, packet_data);
     String::writeString(identificator, packet_data);
     VarInt::writeVarInt(data.size(), packet_data);
 
